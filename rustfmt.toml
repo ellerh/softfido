@@ -1,0 +1,6 @@
+fn_single_line = true
+#fn_args_layout="Compressed"
+max_width = 78
+use_small_heuristics = "MAX"
+# hard_tabs=true
+# tab_spaces = 8
