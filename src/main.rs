@@ -15,6 +15,7 @@ use std::error::{Error};
 use std::convert::TryFrom;
     
 mod usbip;
+mod hid;
 
 fn main() {
     let listener = TcpListener::bind("192.168.178.22:3240").unwrap();

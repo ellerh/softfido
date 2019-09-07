@@ -4,6 +4,7 @@
 
 include!(concat!(env!("OUT_DIR"), "/usbip_bindings.rs"));
 
+use crate::hid;
 use packed_struct::PackedStruct;
 use packed_struct::PrimitiveEnum;
 use std::convert::TryFrom;
@@ -142,7 +143,7 @@ enum DeviceState {
 
 #[derive(Debug, Clone)]
 struct RequestError {
-    msg: String
+    msg: String,
 }
 
 impl std::fmt::Display for RequestError {
@@ -169,49 +170,50 @@ pub struct Device {
 }
 
 impl Device {
-    // use crate::BRequest::*;
 
     pub fn new() -> Device {
-        let hid_report_descriptor: Vec<u8> = vec![
-	    0x05, 0x01, //Usage Page (Generic Desktop),
-	    0x09, 0x06,	//Usage (Keyboard),
-	    0xA1, 0x01,	//Collection (Application),
-	    0x05, 0x07, //  Usage Page (Key Codes);
-	    0x19, 0xE0, //  Usage Minimum (224),
-	    0x29, 0xE7, //  Usage Maximum (231),
-	    0x15, 0x00, //  Logical Minimum (0),
-	    0x25, 0x01, //  Logical Maximum (1),
-	    0x75, 0x01, //  Report Size (1),
-	    0x95, 0x08, //  Report Count (8),
-	    0x81, 0x02, //  Input (Data, Variable, Absolute),
-	    0x95, 0x01, //  Report Count (1),
-	    0x75, 0x08, //  Report Size (8),
-	    0x81, 0x01, //  Input (Constant),
-	    0x95, 0x05, //  Report Count (5),
-	    0x75, 0x01, //  Report Size (1),
-	    0x05, 0x08, //  Usage Page (Page# for LEDs),
-	    0x19, 0x01, //  Usage Minimum (1),
-	    0x29, 0x05, //  Usage Maximum (5),
-	    0x91, 0x02, //  Output (Data, Variable, Absolute),
-	    0x95, 0x01, //  Report Count (1),
-	    0x75, 0x03, //  Report Size (3),
-	    0x91, 0x01, //  Output (Constant),
-	    0x95, 0x06, //  Report Count (6),
-	    0x75, 0x08, //  Report Size (8),
-	    0x15, 0x00, //  Logical Minimum (0),
-	    0x25, 0x65, //  Logical Maximum(101),
-	    0x05, 0x07, //  Usage Page (Key Codes),
-	    0x19, 0x00, //  Usage Minimum (0),
-	    0x29, 0x65, //  Usage Maximum (101),
-            0x81, 0x00, //  Input (Data, Array),
-	    0xC0,       //End Collection
-        ];
-
+        let hid_report_descriptor: Vec<u8> = {
+            use hid::*;
+            [usage_page(GENERIC_DESKTOP),
+             usage(KEYBOARD),
+             collection(APPLICATION),
+             usage_page(KEY_CODES),
+             usage_minimum(224),
+             usage_maximum(231),
+             logical_minimum(0),
+             logical_maximum(1),
+             report_size(1),
+             report_count(8),
+             input(DATA | VARIABLE | ABSOLUTE),
+             report_size(1),
+             report_count(8),
+             input(CONSTANT),
+             report_size(1),
+             report_count(5),
+             usage_page(LEDS),
+             usage_minimum(1),
+             usage_maximum(5),
+             output(DATA | VARIABLE | ABSOLUTE),
+             report_size(3),
+             report_count(1),
+             output(CONSTANT),
+             report_size(8),
+             report_count(6),
+             logical_minimum(0),
+             logical_maximum(101),
+             usage_page(KEY_CODES),
+             usage_minimum(0),
+             usage_maximum(101),
+             input(DATA | ARRAY),
+             end_collection(),
+            ].iter().flatten().map(|&u8| u8).collect()
+        };
+        
         Device {
             state: DeviceState::Default,
             device_descriptor: usb_device_descriptor {
-                bLength: u8::try_from(
-                    size_of::<usb_device_descriptor>()).unwrap(),
+                bLength: u8::try_from(size_of::<usb_device_descriptor>())
+                    .unwrap(),
                 bDescriptorType: DescriptorType::DEVICE.to_primitive(),
                 bcdUSB: 0x0110u16.to_le(),
                 bDeviceClass: USB_CLASS_PER_INTERFACE as u8,
@@ -224,29 +226,31 @@ impl Device {
                 iManufacturer: 1,
                 iProduct: 2,
                 iSerialNumber: 3,
-                bNumConfigurations: 1
+                bNumConfigurations: 1,
             },
             config_descriptor: usb_config_descriptor {
-                bLength: u8::try_from(
-                    size_of::<usb_config_descriptor>()).unwrap(),
+                bLength: u8::try_from(size_of::<usb_config_descriptor>())
+                    .unwrap(),
                 bDescriptorType: DescriptorType::CONFIGURATION.to_primitive(),
                 wTotalLength: u16::try_from(
                     size_of::<usb_config_descriptor>()
                         + size_of::<usb_interface_descriptor>()
                         + size_of::<usb_hid_descriptor>()
                         //+ hid_report_descriptor.len()
-                        + 2 * USB_DT_ENDPOINT_SIZE as usize)
-                    .unwrap().to_le(),
+                        + 2 * USB_DT_ENDPOINT_SIZE as usize,
+                )
+                .unwrap()
+                .to_le(),
                 bNumInterfaces: 1,
                 bConfigurationValue: 0,
                 iConfiguration: 4,
-                bmAttributes: (USB_CONFIG_ATT_ONE
-                               |USB_CONFIG_ATT_SELFPOWER) as u8,
-                bMaxPower: 0
+                bmAttributes: (USB_CONFIG_ATT_ONE | USB_CONFIG_ATT_SELFPOWER)
+                    as u8,
+                bMaxPower: 0,
             },
             interface_descriptor: usb_interface_descriptor {
-                bLength: u8::try_from(
-                    size_of::<usb_interface_descriptor>()).unwrap(),
+                bLength: u8::try_from(size_of::<usb_interface_descriptor>())
+                    .unwrap(),
                 bDescriptorType: DescriptorType::INTERFACE.to_primitive(),
                 bInterfaceNumber: 0,
                 bAlternateSetting: 0,
@@ -264,7 +268,7 @@ impl Device {
                 bNumDescriptors: 1,
                 bReportDescriptorType: HID_DT_REPORT as u8,
                 wReportDescriptorLength: (hid_report_descriptor.len() as u16)
-                    .to_le()
+                    .to_le(),
             },
             hid_report_descriptor: hid_report_descriptor,
             endpoint_descriptors: vec![
@@ -272,36 +276,42 @@ impl Device {
                     bLength: USB_DT_ENDPOINT_SIZE as u8,
                     bDescriptorType: DescriptorType::ENDPOINT.to_primitive(),
                     bEndpointAddress: ((1 & USB_ENDPOINT_NUMBER_MASK)
-                                       |(USB_DIR_IN & USB_ENDPOINT_DIR_MASK))
+                        | (USB_DIR_IN & USB_ENDPOINT_DIR_MASK))
                         as u8,
                     bmAttributes: USB_ENDPOINT_XFER_INT as u8,
                     wMaxPacketSize: (((8 & USB_ENDPOINT_MAXP_MASK) as u16)
-                                     .to_le()),
+                        .to_le()),
                     bInterval: 255,
                     bRefresh: 0,
-                    bSynchAddress: 0
+                    bSynchAddress: 0,
                 },
                 usb_endpoint_descriptor {
                     bLength: USB_DT_ENDPOINT_SIZE as u8,
                     bDescriptorType: DescriptorType::ENDPOINT.to_primitive(),
                     bEndpointAddress: ((2 & USB_ENDPOINT_NUMBER_MASK)
-                                       |(USB_DIR_OUT & USB_ENDPOINT_DIR_MASK))
+                        | (USB_DIR_OUT & USB_ENDPOINT_DIR_MASK))
                         as u8,
                     bmAttributes: USB_ENDPOINT_XFER_INT as u8,
                     wMaxPacketSize: ((8 & USB_ENDPOINT_MAXP_MASK) as u16)
-                                     .to_le(),
+                        .to_le(),
                     bInterval: 8,
                     bRefresh: 0,
-                    bSynchAddress: 0
-                }
+                    bSynchAddress: 0,
+                },
             ],
-            strings: vec!["string0", "Softcompany", "Softproduct", "v0",
-                          "Default Config", "The Interface"],
+            strings: vec![
+                "string0",
+                "Softcompany",
+                "Softproduct",
+                "v0",
+                "Default Config",
+                "The Interface",
+            ],
         }
     }
 
     fn get_lang_descriptor(&self, sink: &mut Write) -> Result<(), Error> {
-        let d = usb_string_descriptor{
+        let d = usb_string_descriptor {
             bLength: size_of::<usb_string_descriptor>() as u8,
             bDescriptorType: DescriptorType::STRING.to_primitive(),
             wData: [LANG_ID_EN_US.to_le()],
@@ -309,27 +319,39 @@ impl Device {
         write_struct(sink, &d)
     }
 
-    fn get_string_descriptor(&self, index: u8, sink: &mut Write)
-                             -> Result<(), Error> {
+    fn get_string_descriptor(
+        &self,
+        index: u8,
+        sink: &mut Write,
+    ) -> Result<(), Error> {
         assert!(index > 0);
         let text = self.strings[index as usize];
         let utf16_len = text.encode_utf16().count();
         let mut v = Vec::<u8>::with_capacity(utf16_len);
         text.encode_utf16().for_each(|u| {
-            let bs =u.to_le_bytes();
+            let bs = u.to_le_bytes();
             v.push(bs[0]);
             v.push(bs[1])
         });
-        sink.write_all(&[2+(utf16_len*2) as u8,
-                         DescriptorType::STRING.to_primitive()])?;
+        sink.write_all(&[
+            2 + (utf16_len * 2) as u8,
+            DescriptorType::STRING.to_primitive(),
+        ])?;
         sink.write_all(&v)
     }
 
-    fn get_descriptor(&self, r#type: DescriptorType, index: u8,
-                      lang: u16, length: u16, sink: &mut Write)
-        -> Result<(), Error> {
-        println!("GET_DESCRIPTOR: type: {:?} index: {} lang: {} length: {} ",
-                 r#type, index, lang, length);
+    fn get_descriptor(
+        &self,
+        r#type: DescriptorType,
+        index: u8,
+        lang: u16,
+        length: u16,
+        sink: &mut Write,
+    ) -> Result<(), Error> {
+        println!(
+            "GET_DESCRIPTOR: type: {:?} index: {} lang: {} length: {} ",
+            r#type, index, lang, length
+        );
         use DescriptorType::*;
         match (r#type, index, lang) {
             (DEVICE, 0, 0) => write_struct(sink, &self.device_descriptor),
@@ -337,33 +359,46 @@ impl Device {
                 write_struct(sink, &self.config_descriptor)?;
                 write_struct(sink, &self.interface_descriptor)?;
                 write_struct(sink, &self.hid_descriptor)?;
-                self.endpoint_descriptors.iter()
-                    .map(|epd| sink.write_all(&(unsafe {any_as_u8_slice(epd)}
-                                                [..epd.bLength as usize]
-                    )))
+                self.endpoint_descriptors
+                    .iter()
+                    .map(|epd| {
+                        sink.write_all(
+                            &(unsafe { any_as_u8_slice(epd) }
+                                [..epd.bLength as usize]),
+                        )
+                    })
                     .find(|e| e.is_err())
                     .unwrap_or(Ok(()))
-            },
+            }
             (STRING, 0, 0) => self.get_lang_descriptor(sink),
             (STRING, i, LANG_ID_EN_US) => self.get_string_descriptor(i, sink),
             x => panic!("Unsupported descriptor: {:?}", x),
         }
     }
 
-    fn get_interface_descriptor(&self, type_: u8, index: u8,
-                                lang: u16, length: u16, sink: &mut Write)
-                                -> Result<(), Error> {
-        println!("GET_DESCRIPTOR/i: type: {:?} index: {} lang: {} length: {} ",
-                 type_, index, lang, length);
+    fn get_interface_descriptor(
+        &self,
+        type_: u8,
+        index: u8,
+        lang: u16,
+        length: u16,
+        sink: &mut Write,
+    ) -> Result<(), Error> {
+        println!(
+            "GET_DESCRIPTOR/i: type: {:?} index: {} lang: {} length: {} ",
+            type_, index, lang, length
+        );
         match type_ as u32 {
-            HID_DT_REPORT =>
-                sink.write_all(&self.hid_report_descriptor),
+            HID_DT_REPORT => sink.write_all(&self.hid_report_descriptor),
             x => panic!("Unsupported descriptor type: {}", x),
         }
     }
 
-    fn ep0_request(&self, setup: &[u8; 8], sink: &mut Write)
-    -> Result<(), Box<std::error::Error>> {
+    fn ep0_request(
+        &self,
+        setup: &[u8; 8],
+        sink: &mut Write,
+    ) -> Result<(), Box<std::error::Error>> {
         let req = SetupPacket::unpack(setup).unwrap();
         let wValue = u16::from_le(req.wValue);
         let wIndex = u16::from_le(req.wIndex);
@@ -373,52 +408,76 @@ impl Device {
                 direction: DataTransferDirection::DeviceToHost,
                 type_: RequestType::Standard,
                 recipient: RequestRecipient::Device,
-            } => match (StandardRequest::from_primitive(req.bRequest).unwrap(),
-                        wValue, wIndex, wLength) {
+            } => match (
+                StandardRequest::from_primitive(req.bRequest).unwrap(),
+                wValue,
+                wIndex,
+                wLength,
+            ) {
                 (StandardRequest::GET_DESCRIPTOR, value, lang, length) => {
                     let [idx, ty] = value.to_le_bytes();
                     match DescriptorType::from_primitive(ty) {
-                        Some(ty) => self.get_descriptor(ty, idx, lang, length,
-                                                        sink)?,
+                        Some(ty) => {
+                            self.get_descriptor(ty, idx, lang, length, sink)?
+                        }
                         None => Err(RequestError {
-                            msg: format!("unknown descriptor type: {}", ty)
+                            msg: format!("unknown descriptor type: {}", ty),
                         })?,
                     }
-                },
-                x => panic!("Unsupported device-to-host/standard/device \
-                             request: {:?}", x),
+                }
+                x => panic!(
+                    "Unsupported device-to-host/standard/device \
+                     request: {:?}",
+                    x
+                ),
             },
             BmRequestType {
                 direction: DataTransferDirection::HostToDevice,
                 type_: RequestType::Standard,
                 recipient: RequestRecipient::Device,
-            } => match (StandardRequest::from_primitive(req.bRequest).unwrap(),
-                        wValue, wIndex, wLength) {
+            } => match (
+                StandardRequest::from_primitive(req.bRequest).unwrap(),
+                wValue,
+                wIndex,
+                wLength,
+            ) {
                 (StandardRequest::SET_CONFIGURATION, 0, 0, 0) => (),
                 (StandardRequest::GET_STATUS, 0, 0, 0) => (),
-                x => panic!("Unsupported host-to-device/standard/device \
-                             request: {:?}", x)
+                x => panic!(
+                    "Unsupported host-to-device/standard/device \
+                     request: {:?}",
+                    x
+                ),
             },
             BmRequestType {
                 direction: DataTransferDirection::HostToDevice,
                 type_: RequestType::Class,
-                recipient: RequestRecipient::Interface
-            } => match (HIDRequest::from_primitive(req.bRequest).unwrap(),
-                        wValue, wIndex, wLength) {
+                recipient: RequestRecipient::Interface,
+            } => match (
+                HIDRequest::from_primitive(req.bRequest).unwrap(),
+                wValue,
+                wIndex,
+                wLength,
+            ) {
                 (HIDRequest::SET_IDLE, 0, 0, 0) => (),
                 x => panic!("Unsupported hid request index: {:?}", x),
             },
             BmRequestType {
                 direction: DataTransferDirection::DeviceToHost,
                 type_: RequestType::Standard,
-                recipient: RequestRecipient::Interface
-            } => match (StandardRequest::from_primitive(req.bRequest).unwrap(),
-                        wValue, wIndex, wLength) {
+                recipient: RequestRecipient::Interface,
+            } => match (
+                StandardRequest::from_primitive(req.bRequest).unwrap(),
+                wValue,
+                wIndex,
+                wLength,
+            ) {
                 (StandardRequest::GET_DESCRIPTOR, value, index, length) => {
                     let [idx, ty] = value.to_le_bytes();
-                    self.get_interface_descriptor (ty, idx, index, length,
-                                                   sink)?
-                },
+                    self.get_interface_descriptor(
+                        ty, idx, index, length, sink,
+                    )?
+                }
                 x => panic!("Unsupported interface request: {:?}", x),
             },
             x => panic!("Unsupported bRequestType: {:?}", x),
@@ -426,35 +485,43 @@ impl Device {
         Ok(())
     }
 
-    fn ep1_request(&self, _setup: &[u8; 8], sink: &mut Write)
-                   -> Result<(), Box<std::error::Error>> {
+    fn ep1_request(
+        &self,
+        _setup: &[u8; 8],
+        sink: &mut Write,
+    ) -> Result<(), Box<std::error::Error>> {
         let modifiers: u8 = 0;
-        let key:u8 = 10 + rand::random::<u8>()/16;
+        let key: u8 = 10 + rand::random::<u8>() / 16;
         sink.write_all(&[modifiers, 0, key, 0, 0, 0, 0, 0, 0])?;
         std::thread::sleep(std::time::Duration::from_millis(200));
         Ok(())
     }
 
-    fn ep2_request(&self, _setup: &[u8; 8], source: &mut Read)
-                   -> Result<(), Box<std::error::Error>> {
+    fn ep2_request(
+        &self,
+        _setup: &[u8; 8],
+        source: &mut Read,
+    ) -> Result<(), Box<std::error::Error>> {
         let mut leds = [0u8];
         source.read_exact(&mut leds[..])?;
         Ok(())
     }
 
-    pub fn process_request(&self, endpoint: u8, setup: &[u8; 8],
-                           sink: &mut Write, source: &mut Read)
-                           -> Result<(), Box<std::error::Error>> {
+    pub fn process_request(
+        &self,
+        endpoint: u8,
+        setup: &[u8; 8],
+        sink: &mut Write,
+        source: &mut Read,
+    ) -> Result<(), Box<std::error::Error>> {
         match endpoint {
             0 => self.ep0_request(setup, sink),
             1 => self.ep1_request(setup, sink),
             2 => self.ep2_request(setup, source),
-            x => panic!("Unsupported endpoint request: {}", x)
+            x => panic!("Unsupported endpoint request: {}", x),
         }
     }
 }
-
-
 
 fn read_struct<T>(stream: &mut Read) -> Result<T, Error> {
     unsafe {
@@ -539,44 +606,61 @@ pub fn write_op_rep_import(stream: &mut Write) -> Result<(), Error> {
     write_struct(stream, &usb_device())
 }
 
-pub fn write_submit_reply (stream: &mut Write, header: &usbip_header,
-                           data: &[u8]) -> Result<(),Error> {
-    write_struct(stream, &usbip_header_basic {
-        command: USBIP_RET_SUBMIT.to_be(),
-        seqnum: header.base.seqnum,
-        devid: header.base.devid,
-        direction: USBIP_DIR_OUT.to_be(),
-        ep: header.base.ep
-    })?;
-    write_struct(stream, &usbip_header_ret_submit {
-        status: 0,
-        actual_length: i32::try_from(data.len()).unwrap().to_be(),
-        start_frame: 0,
-        number_of_packets: 0,
-        error_count: 0
-    })?;
-    stream.write(&[0u8; 8])?;   // SETUP
+pub fn write_submit_reply(
+    stream: &mut Write,
+    header: &usbip_header,
+    data: &[u8],
+) -> Result<(), Error> {
+    write_struct(
+        stream,
+        &usbip_header_basic {
+            command: USBIP_RET_SUBMIT.to_be(),
+            seqnum: header.base.seqnum,
+            devid: header.base.devid,
+            direction: USBIP_DIR_OUT.to_be(),
+            ep: header.base.ep,
+        },
+    )?;
+    write_struct(
+        stream,
+        &usbip_header_ret_submit {
+            status: 0,
+            actual_length: i32::try_from(data.len()).unwrap().to_be(),
+            start_frame: 0,
+            number_of_packets: 0,
+            error_count: 0,
+        },
+    )?;
+    stream.write(&[0u8; 8])?; // SETUP
     stream.write(data)?;
     Ok(())
 }
 
-pub fn write_submit_reply_error (stream: &mut Write, header: &usbip_header)
-                                 -> Result<(),Error> {
-    write_struct(stream, &usbip_header_basic {
-        command: USBIP_RET_SUBMIT.to_be(),
-        seqnum: header.base.seqnum,
-        devid: header.base.devid,
-        direction: USBIP_DIR_OUT.to_be(),
-        ep: header.base.ep
-    })?;
-    write_struct(stream, &usbip_header_ret_submit {
-        status: 1,
-        actual_length: 0,
-        start_frame: 0,
-        number_of_packets: 0,
-        error_count: 0
-    })?;
-    stream.write(&[0u8; 8])?;   // SETUP
+pub fn write_submit_reply_error(
+    stream: &mut Write,
+    header: &usbip_header,
+) -> Result<(), Error> {
+    write_struct(
+        stream,
+        &usbip_header_basic {
+            command: USBIP_RET_SUBMIT.to_be(),
+            seqnum: header.base.seqnum,
+            devid: header.base.devid,
+            direction: USBIP_DIR_OUT.to_be(),
+            ep: header.base.ep,
+        },
+    )?;
+    write_struct(
+        stream,
+        &usbip_header_ret_submit {
+            status: 1,
+            actual_length: 0,
+            start_frame: 0,
+            number_of_packets: 0,
+            error_count: 0,
+        },
+    )?;
+    stream.write(&[0u8; 8])?; // SETUP
     Ok(())
 }
 
@@ -593,8 +677,5 @@ pub fn read_cmd_header(stream: &mut Read) -> Result<usbip_header, Error> {
 }
 
 pub unsafe fn any_as_u8_slice<T>(p: &T) -> &mut [u8] {
-    std::slice::from_raw_parts_mut(
-        (p as *const T) as *mut u8,
-        size_of::<T>(),
-    )
+    std::slice::from_raw_parts_mut((p as *const T) as *mut u8, size_of::<T>())
 }
