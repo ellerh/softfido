@@ -425,6 +425,8 @@ impl Device {
                         })?,
                     }
                 }
+                (StandardRequest::GET_STATUS, 0, 0, 2) =>
+                    sink.write_all(&[1u8,0])?,
                 x => panic!(
                     "Unsupported device-to-host/standard/device \
                      request: {:?}",
@@ -442,7 +444,6 @@ impl Device {
                 wLength,
             ) {
                 (StandardRequest::SET_CONFIGURATION, 0, 0, 0) => (),
-                (StandardRequest::GET_STATUS, 0, 0, 0) => (),
                 x => panic!(
                     "Unsupported host-to-device/standard/device \
                      request: {:?}",
