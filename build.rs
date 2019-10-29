@@ -1,8 +1,5 @@
 extern crate bindgen;
 
-use std::env;
-use std::path::PathBuf;
-
 fn main() {
     let bindings = bindgen::Builder::default()
         // The input header we would like to generate
@@ -20,6 +17,7 @@ fn main() {
         .whitelist_var("USBIP_CMD_SUBMIT")
         .whitelist_var("USBIP_RET_SUBMIT")
         .whitelist_var("USBIP_CMD_UNLINK")
+        .whitelist_var("USBIP_RET_UNLINK")
         .whitelist_var("USBIP_DIR_IN")
         .whitelist_var("USBIP_DIR_OUT")
         .whitelist_var("USBIP_DIR_OUT")
@@ -40,6 +38,8 @@ fn main() {
         .whitelist_var("USB_ENDPOINT_DIR_MASK")
         .whitelist_var("USB_ENDPOINT_XFER_INT")
         .whitelist_var("USB_ENDPOINT_MAXP_MASK")
+        .whitelist_var("EINPROGRESS")
+        .whitelist_var("ENOENT")
         .whitelist_var("HID_DT_HID")
         .whitelist_var("HID_DT_REPORT")
         // .whitelist_var("USB_TYPE_STANDARD")
@@ -57,8 +57,8 @@ fn main() {
         .expect("Unable to generate bindings");
 
     // Write the bindings to the $OUT_DIR/bindings.rs file.
-    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let out_path = std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap());
     bindings
-        .write_to_file(out_path.join("usbip_bindings.rs"))
+        .write_to_file(out_path.join("bindings.rs"))
         .expect("Couldn't write bindings!");
 }

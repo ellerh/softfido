@@ -1,9 +1,11 @@
-fn short_item(bType: u8, bTag: u8, data: u32) -> Vec<u8> {
-    let b0 = |bSize: u8| {
-        assert!(bSize <= 0b11);
-        assert!(bType <= 0b10);
-        assert!(bTag <= 0b1111);
-        bSize | (bType << 2) | (bTag << 4)
+#![allow(dead_code)]
+
+fn short_item(typ: u8, tag: u8, data: u32) -> Vec<u8> {
+    let b0 = |size: u8| {
+        assert!(size <= 0b11);
+        assert!(typ <= 0b10);
+        assert!(tag <= 0b1111);
+        size | (typ << 2) | (tag << 4)
     };
     let bytes = data.to_le_bytes();
     match data {
@@ -38,11 +40,16 @@ define_item!(logical_maximum, GLOBAL, 0b0010, u32);
 define_item!(report_size, GLOBAL, 0b0111, u32);
 define_item!(report_count, GLOBAL, 0b1001, u32);
 
-pub const KEYBOARD: u32 = 0x06;
+#[allow(dead_code)]
+pub const KEYBOARD: u16 = 0x06;
 
-define_item!(usage, LOCAL, 0b0000, u32);
-define_item!(usage_minimum, LOCAL, 0b0001, u32);
-define_item!(usage_maximum, LOCAL, 0b0010, u32);
+pub const CTAPHID: u16 = 0x1;
+pub const FIDO_USAGE_DATA_IN: u16 = 0x20;
+pub const FIDO_USAGE_DATA_OUT: u16 = 0x21;
+
+define_item!(usage, LOCAL, 0b0000, u16);
+//define_item!(usage_minimum, LOCAL, 0b0001, u32);
+//define_item!(usage_maximum, LOCAL, 0b0010, u32);
 
 pub const APPLICATION: u8 = 0x01;
 

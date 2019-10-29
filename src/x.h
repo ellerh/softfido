@@ -7,3 +7,4 @@
 
 #include <linux/usb/ch9.h>
 #include <linux/hid.h>
+#include <errno.h>

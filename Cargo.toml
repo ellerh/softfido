@@ -11,6 +11,13 @@ packed_struct = "0.3"
 packed_struct_codegen = "0.3"
 # bitflags = "1.1.0"
 rand = "0.7.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_cbor = "0.10.2"
+pkcs11 = "0.4.0"
+rust-crypto = "^0.2"
+libc = "0.2"
+pinentry-rs = "0.1.0"
+secstr = "0.3.2"
 
 [build-dependencies]
 bindgen = "0.51"
