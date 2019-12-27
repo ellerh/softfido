@@ -4,43 +4,31 @@ extern crate pkcs11;
 extern crate crypto as rust_crypto;
 
 #[macro_use] extern crate packed_struct_codegen;
-//#[macro_use] extern crate serde;
-//use packed_struct::PackedStruct;
-
-// #[macro_use]
-// extern crate bitflags;
-
-use std::net::{TcpListener, TcpStream};
-use std::error::{Error};
-// use std::io::Read;
-// use std::io::BufReader;
-
-//use std::convert::TryFrom;
-
-#[macro_use]
-mod macros;
-#[macro_use]
-mod prompt;
+#[macro_use] mod macros;
 
 mod usbip;
 mod hid;
 mod ctaphid;
 mod eventloop;
 mod crypto;
+mod prompt;
 
+use std::net::{TcpListener, TcpStream};
+use std::error::{Error};
 use usbip::bindings as c;
 
 struct Args {
     //arg0: String,
     pkcs11_module: String,
     token_label: String,
+    pin_file: Option<String>,
 }
 
 fn main() {
     let args = parse_args();
     let token = match crypto::open_token(
         std::path::Path::new(&args.pkcs11_module),
-        &args.token_label) {
+        &args.token_label, &args.pin_file) {
         Ok(x) => x,
         Err(err) => panic!("Failed to open token: {}", err)
     };
@@ -52,12 +40,31 @@ fn main() {
     }
 }
 
-fn parse_args() -> Args {
-    let mut args = std::env::args().skip(1);
-    let mut r = Args {
+fn default_args() -> Args {
+    Args {
         pkcs11_module: "/usr/lib/softhsm/libsofthsm2.so".to_string(),
         token_label: "softfido".to_string(),
-    };
+        pin_file: None,
+    }
+}
+
+fn print_usage() {
+    let args = default_args();
+    let prog = std::env::args().next().unwrap_or("<progname>".to_string());
+    println!("USAGE: {} [OPTIONS]", prog);
+    println!("OPTIONS:");
+    println!("  --help                   Print help information");
+    println!("  --token-label <LABEL>    Use LABEL to find the crypto token \
+              [{}]", args.token_label);
+    println!("  --pkcs11-module <LIB>    Load LIB to access the PCKC11 store \
+              [{}]", args.pkcs11_module);
+    println!("  --pin-file <FILE>        Read gpg encryped User-PIN from FILE \
+              [{:?}]", args.pin_file);
+}
+
+fn parse_args() -> Args {
+    let mut args = std::env::args().skip(1);
+    let mut r = default_args();
     fn req (arg: Option<String>, name: &str) -> String {
         match arg {
             Some(s) => s,
@@ -74,6 +81,13 @@ fn parse_args() -> Args {
                 "--token-label" => {
                     r.token_label = req(args.next(), "--token-label");
                 },
+                "--pin-file" => {
+                    r.pin_file = Some(req(args.next(), "--pin-file"));
+                },
+                "--help" => {
+                    print_usage();
+                    std::process::exit(0)
+                }
                 x => panic!("Invalid argument: {}", x),
             }
         }
@@ -81,7 +95,7 @@ fn parse_args() -> Args {
 }
 
 fn handle_stream (stream: &mut TcpStream, token: &crypto::KeyStore)
-                  -> Result<(), Box<Error>> {
+                  -> Result<(), Box<dyn Error>> {
     stream.set_nodelay(true)?;
     let (version, code, status) = usbip::read_op_common(stream)?;
     match (version, code as u32, status) {
@@ -110,7 +124,7 @@ fn handle_stream (stream: &mut TcpStream, token: &crypto::KeyStore)
 }
 
 fn handle_commands (stream: &mut TcpStream, token: &crypto::KeyStore)
-                    -> Result<(), Box<Error>> {
+                    -> Result<(), Box<dyn Error>> {
     let mut dev = usbip::Device::new(token);
     let mut el = eventloop::EventLoop::new(&mut dev);
     usbip::Device::init_callbacks(&mut el);

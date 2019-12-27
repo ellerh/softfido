@@ -3,15 +3,15 @@ use crate::usbip::bindings::{usbip_header,
                              USBIP_DIR_IN, USBIP_DIR_OUT,
                              USBIP_CMD_SUBMIT, USBIP_CMD_UNLINK,
                              EINPROGRESS, ENOENT,};
-use std::error::Error;
 use std::convert::TryFrom;
 use std::net::TcpStream;
 use std::io::Read;
 
+type R<T> = Result<T, Box<dyn std::error::Error>>;
+
 type Dev2HostCallback<T> = fn(&mut EventLoop<T>, &[u8; 8], &mut [u8])
-                              -> Result<bool, Box<Error>>;
-type Host2DevCallback<T> = fn(&mut EventLoop<T>, &[u8; 8], &[u8])
-                              -> Result<bool, Box<Error>>;
+                              -> R<bool>;
+type Host2DevCallback<T> = fn(&mut EventLoop<T>, &[u8; 8], &[u8]) -> R<bool>;
 
 pub enum Handler<T> {
     Dev2Host(u8, Dev2HostCallback<T>),
@@ -38,10 +38,7 @@ impl<'a, T> EventLoop<'a, T> {
         }
     }
 
-    pub fn schedule(
-        &mut self,
-        handler: Handler<T>,
-    ) -> Result<(), Box<Error>> {
+    pub fn schedule(&mut self, handler: Handler<T>,) -> R<()> {
         self.handlers.push(handler);
         Ok(())
     }
@@ -70,10 +67,7 @@ impl<'a, T> EventLoop<'a, T> {
         ()
     }
                            
-    pub fn handle_commands(
-        &mut self,
-        stream: &mut TcpStream,
-    ) -> Result<(), Box<Error>> {
+    pub fn handle_commands(&mut self, stream: &mut TcpStream,) -> R<()> {
         loop {
             let header = usbip::read_cmd_header(stream)?;
             match u32::from_be(header.base.command) {
@@ -97,7 +91,7 @@ impl<'a, T> EventLoop<'a, T> {
         &mut self,
         header: &usbip_header,
         stream: &mut TcpStream,
-    ) -> Result<(), Box<Error>> {
+    ) -> R<()> {
         let endpoint = u8::try_from(u32::from_be(header.base.ep))?;
         let seqnum = u32::from_be(header.base.seqnum);
         let dev2host = match u32::from_be(header.base.direction) {
@@ -129,7 +123,7 @@ impl<'a, T> EventLoop<'a, T> {
             Some(Dev2Host(ep, f)) => {
                 match f(self, &cmd.setup, &mut v[..]) {
                     Err(err) => {
-                        println!("Request Error: {:?}", err);
+                        println!("Request Error: {} {:?}", err, err);
                         usbip::write_submit_reply_error(stream, header)?;
                         self.handlers.push(Dev2Host(ep, f));
                         return Err(err)
@@ -168,7 +162,7 @@ impl<'a, T> EventLoop<'a, T> {
         buffer: &[u8],
         f: Host2DevCallback<T>,
         stream: &mut TcpStream,
-    ) -> Result<bool, Box<Error>> {
+    ) -> R<bool> {
         match f(self, setup, buffer) {
             Err(err) => {
                 panic!("Request Error: {:?}", err);
@@ -183,7 +177,7 @@ impl<'a, T> EventLoop<'a, T> {
     }
 
     fn handle_unlink (&mut self, header: &usbip_header,
-                      stream: &mut TcpStream) -> Result<(), Box<Error>> {
+                      stream: &mut TcpStream) -> R<()> {
         let seqnum = u32::from_be(header.base.seqnum);
         let beseqnum = unsafe{ header.u.cmd_unlink.seqnum };
         let useqnum = u32::from_be(beseqnum);

@@ -20,6 +20,7 @@ use std::mem::size_of;
 use std::cmp::min;
 use bindings::*;
 
+type R<T> = Result<T, Box<dyn std::error::Error>>;
 
 pub const USBIP_VERSION: u16 = 0x0111u16;
 const LANG_ID_EN_US: u16 = 0x0409;
@@ -292,7 +293,7 @@ impl<'a> Device<'a> {
             ],
             strings: vec![
                 "string0",
-                "Softcompany",
+                "Fakecompany",
                 "Softproduct",
                 "v0",
                 "Default Config",
@@ -307,8 +308,8 @@ impl<'a> Device<'a> {
         let d2h = eventloop::Handler::Dev2Host
             (0,
              |el: &mut eventloop::EventLoop<Device>,
-             setup: &[u8; 8], data: &mut [u8]| ->
-             Result<bool, Box<std::error::Error>> {
+             setup: &[u8; 8], data: &mut [u8]| -> R<bool>
+             {
                  el.state.ep0_dev2host(setup, data)?;
                  Ok(true)
              });
@@ -316,8 +317,7 @@ impl<'a> Device<'a> {
         let h2d = eventloop::Handler::Host2Dev
             (0,
              |el: &mut eventloop::EventLoop<Device>,
-             setup: &[u8; 8], data: &[u8]| ->
-             Result<bool, Box<std::error::Error>> {
+             setup: &[u8; 8], data: &[u8]| -> R<bool> {
                  el.state.ep0_host2dev(setup, data)?;
                  Ok(true)
              });
@@ -325,16 +325,14 @@ impl<'a> Device<'a> {
         let d2h1 = eventloop::Handler::Dev2Host(
             1,
             |el: &mut eventloop::EventLoop<Device>,
-            _setup: &[u8; 8], data: &mut [u8]| ->
-                Result<bool, Box<std::error::Error>> {
-                    el.state.ep1_dev2host(data)
-                });
+            _setup: &[u8; 8], data: &mut [u8]| -> R<bool> {
+                el.state.ep1_dev2host(data)
+            });
         el.schedule(d2h1).unwrap();
         let h2d2 = eventloop::Handler::Host2Dev
             (2,
              |el: &mut eventloop::EventLoop<Device>,
-             _setup: &[u8; 8], data: &[u8]| ->
-             Result<bool, Box<std::error::Error>> {
+             _setup: &[u8; 8], data: &[u8]| -> R<bool> {
                  el.state.ep2_host2dev(data)?;
                  if !el.state.parser.recv_queue.is_empty()
                      ||!el.state.parser.send_queue.is_empty(){
@@ -345,7 +343,7 @@ impl<'a> Device<'a> {
         el.schedule(h2d2).unwrap();
     }
 
-    fn get_lang_descriptor(&self, sink: &mut Write) -> Result<(), Error> {
+    fn get_lang_descriptor(&self, sink: &mut dyn Write) -> Result<(), Error> {
         let d = usb_string_descriptor {
             bLength: size_of::<usb_string_descriptor>() as u8,
             bDescriptorType: DescriptorType::String.to_primitive(),
@@ -357,7 +355,7 @@ impl<'a> Device<'a> {
     fn get_string_descriptor(
         &self,
         index: u8,
-        sink: &mut Write,
+        sink: &mut dyn Write,
     ) -> Result<(), Error> {
         assert!(index > 0);
         let text = self.strings[index as usize];
@@ -381,7 +379,7 @@ impl<'a> Device<'a> {
         index: u8,
         lang: u16,
         length: u16,
-        sink: &mut Write,
+        sink: &mut dyn Write,
     ) -> Result<(), Error> {
         println!(
             "GET_DESCRIPTOR: type: {:?} index: {} lang: {} length: {} ",
@@ -419,7 +417,7 @@ impl<'a> Device<'a> {
         index: u8,
         lang: u16,
         length: u16,
-        sink: &mut Write,
+        sink: &mut dyn Write,
     ) -> Result<(), Error> {
         println!(
             "GET_DESCRIPTOR/i: type: {:?} index: {} lang: {} length: {} ",
@@ -431,8 +429,7 @@ impl<'a> Device<'a> {
         }
     }
 
-    fn ep0_dev2host(&self, setup: &[u8; 8], sink: &mut [u8],)
-                    -> Result<(), Box<std::error::Error>> {
+    fn ep0_dev2host(&self, setup: &[u8; 8], sink: &mut [u8],) -> R<()> {
         let req = SetupPacket::unpack(setup).unwrap();
         let value = u16::from_le(req.wValue);
         let index = u16::from_le(req.wIndex);
@@ -450,8 +447,7 @@ impl<'a> Device<'a> {
             ) {
                 (StandardRequest::GetDescriptor, value, lang, length) => {
                     let [idx, ty] = value.to_le_bytes();
-                    call_with_write(sink, |sink| ->
-                                    Result<(), Box<std::error::Error>> {
+                    call_with_write(sink, |sink| -> R<()> {
                         match DescriptorType::from_primitive(ty) {
                             Some(ty) => { self.get_descriptor(ty, idx, lang,
                                                               length, sink)?;
@@ -509,8 +505,7 @@ impl<'a> Device<'a> {
         Ok(())
     }
 
-    fn ep0_host2dev (&self, setup: &[u8; 8], _data: &[u8],)
-                     -> Result<(), Box<std::error::Error>> {
+    fn ep0_host2dev (&self, setup: &[u8; 8], _data: &[u8],) -> R<()> {
         let req = SetupPacket::unpack(setup).unwrap();
         let value = u16::from_le(req.wValue);
         let index = u16::from_le(req.wIndex);
@@ -551,8 +546,7 @@ impl<'a> Device<'a> {
     }
 
 
-    fn ep1_dev2host(&mut self, buf: &mut [u8])
-                    -> Result<bool, Box<std::error::Error>> {
+    fn ep1_dev2host(&mut self, buf: &mut [u8]) -> R<bool> {
         log!("ep1 dev->host");
         while !self.parser.recv_queue.is_empty() {
             self.parser.parse()?
@@ -568,8 +562,7 @@ impl<'a> Device<'a> {
         }
     }
 
-    fn ep2_host2dev (&mut self, data: &[u8])
-                     -> Result<bool, Box<std::error::Error>> {
+    fn ep2_host2dev (&mut self, data: &[u8]) -> R<bool> {
         log!("ep2 host->dev");
         self.parser.recv_queue.push_back(data.to_vec());
         Ok(true)
@@ -592,7 +585,7 @@ impl<'a> Device<'a> {
 
 }
 
-fn read_struct<T>(stream: &mut Read) -> Result<T, Error> {
+fn read_struct<T>(stream: &mut dyn Read) -> Result<T, Error> {
     unsafe {
         let s = std::mem::MaybeUninit::<T>::uninit();
         stream.read_exact(any_as_u8_slice(&s))?;
@@ -600,11 +593,12 @@ fn read_struct<T>(stream: &mut Read) -> Result<T, Error> {
     }
 }
 
-fn write_struct<T>(stream: &mut Write, s: &T) -> Result<(), Error> {
+fn write_struct<T>(stream: &mut dyn Write, s: &T) -> Result<(), Error> {
     stream.write_all(unsafe { any_as_u8_slice(s) })
 }
 
-pub fn read_op_common(stream: &mut Read) -> Result<(u16, u16, u32), Error> {
+pub fn read_op_common(stream: &mut dyn Read)
+                      -> Result<(u16, u16, u32), Error> {
     let header = read_struct::<op_common>(stream)?;
     Ok((
         u16::from_be(header.version),
@@ -654,7 +648,7 @@ fn usb_interface() -> usbip_usb_interface {
     }
 }
 
-pub fn write_op_rep_devlist(stream: &mut Write) -> Result<(), Error> {
+pub fn write_op_rep_devlist(stream: &mut dyn Write) -> Result<(), Error> {
     write_struct(stream, &op_common(OP_REP_DEVLIST))?;
     write_struct(stream, &op_devlist_reply { ndev: 1u32.to_be() })?;
     write_struct(stream, &usb_device())?;
@@ -662,12 +656,12 @@ pub fn write_op_rep_devlist(stream: &mut Write) -> Result<(), Error> {
     Ok(())
 }
 
-pub fn write_op_rep_import(stream: &mut Write) -> Result<(), Error> {
+pub fn write_op_rep_import(stream: &mut dyn Write) -> Result<(), Error> {
     write_struct(stream, &op_common(OP_REP_IMPORT))?;
     write_struct(stream, &usb_device())
 }
 
-pub fn write_submit_reply(stream: &mut Write, header: &usbip_header,
+pub fn write_submit_reply(stream: &mut dyn Write, header: &usbip_header,
                           data: &[u8], actual_len: Option<i32>)
                           -> Result<(), Error> {
     write_struct(stream,
@@ -698,7 +692,7 @@ pub fn write_submit_reply(stream: &mut Write, header: &usbip_header,
     Ok(())
 }
 
-pub fn write_submit_reply_error(stream: &mut Write, header: &usbip_header)
+pub fn write_submit_reply_error(stream: &mut dyn Write, header: &usbip_header)
                                 -> Result<(), Error> {
     write_struct(stream,
                  &usbip_header {
@@ -722,7 +716,7 @@ pub fn write_submit_reply_error(stream: &mut Write, header: &usbip_header)
     )
 }
 
-pub fn write_unlink_reply (stream: &mut Write, header: &usbip_header,
+pub fn write_unlink_reply (stream: &mut dyn Write, header: &usbip_header,
                            status: i32,) -> Result<(), Error> {
     write_struct(stream,
                  &usbip_header {
@@ -741,7 +735,7 @@ pub fn write_unlink_reply (stream: &mut Write, header: &usbip_header,
                  })
 }
 
-pub fn read_busid(stream: &mut Read) -> Result<String, Error> {
+pub fn read_busid(stream: &mut dyn Read) -> Result<String, Error> {
     let req: op_import_request = read_struct(stream)?;
     Ok(String::from_utf8(
         req.busid.iter().take_while(|&&x| x != 0).map(|&x| x as u8).collect(),
@@ -749,7 +743,7 @@ pub fn read_busid(stream: &mut Read) -> Result<String, Error> {
     .unwrap())
 }
 
-pub fn read_cmd_header(stream: &mut Read) -> Result<usbip_header, Error> {
+pub fn read_cmd_header(stream: &mut dyn Read) -> Result<usbip_header, Error> {
     read_struct(stream)
 }
 
@@ -758,7 +752,7 @@ pub unsafe fn any_as_u8_slice<T>(p: &T) -> &mut [u8] {
 }
 
 fn call_with_write<F,T> (buf: &mut [u8], f: F) -> T
-where F: Fn(&mut Write) -> T
+where F: Fn(&mut dyn Write) -> T
 {
     let mut c = std::io::Cursor::new(Vec::with_capacity(buf.len()));
     let v = f(&mut c);
