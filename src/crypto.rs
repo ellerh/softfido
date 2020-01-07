@@ -5,12 +5,12 @@ use chrono::{DateTime, Utc};
 use cookie_factory;
 use crate::prompt;
 
-pub struct KeyStore {
-    ctx: Ctx,
+pub struct KeyStore<'a> {
+    ctx: &'a Ctx,
     session: CK_SESSION_HANDLE,
 }
 
-impl Drop for KeyStore {
+impl<'a> Drop for KeyStore<'a> {
     fn drop(&mut self) {
         self.ctx.close_session(self.session).unwrap()
     }
@@ -75,10 +75,33 @@ fn read_pin_file(file_name: &str) -> std::io::Result<secstr::SecStr> {
     }
 }
 
-pub fn open_token (module: &std::path::Path, label: &str,
-                   pin_file: &Option<String>)
-                   -> Result<KeyStore, Error> {
-    let ctx = Ctx::new_and_initialize(module)?;
+
+pub mod globals {
+    use std::sync::{Mutex, Arc};
+    use std::path::Path;
+    use pkcs11::{Ctx};
+    lazy_static! {
+        static ref LOCK: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    }
+
+    pub type R<T> = Result<T, Box<dyn std::error::Error>>;
+
+    pub fn with_ctx<T> (module: &str, f: &dyn Fn (&Ctx) -> R<T>) -> R<T> {
+        let mut lock = LOCK.lock().unwrap();
+        let path = Path::new(module);
+        assert!(*lock == 0);
+        *lock = *lock + 1;
+        let ctx = Ctx::new_and_initialize(path)?;
+        let r = f(&ctx);
+        *lock = *lock - 1;
+        assert!(*lock == 0);
+        r
+    }
+}
+
+pub fn open_token<'a> (ctx: &'a Ctx, label: &str,
+                       pin_file: &Option<String>)
+                       -> Result<KeyStore<'a>, Error> {
     let slot_ids = find_token(&ctx, label)?;
     let slot_id = match slot_ids.len() {
         1 => slot_ids[0],
@@ -108,7 +131,9 @@ pub fn open_token (module: &std::path::Path, label: &str,
 }
 
 // OID: 1.2.840.10045.3.1.7
-const SECP256R1_OID: &[u64] = &[1,2,840,10045,3,1,7];
+const OID_SECP256R1: &[u64] = &[1,2,840,10045,3,1,7];
+const OID_EC_PUBLIC_KEY: &[u64] = &[1,2,840,10045,2,1];
+const OID_ECDSA_WITH_SHA256: &[u64] = &[1,2,840,10045,4,3,2];
 
 fn curve_oid (name: &str) -> &'static [u8] {
     // DER encoding of OID: 1.2.840.10045.3.1.7
@@ -178,6 +203,7 @@ fn der_encode_signature (points: &[u8]) -> Vec<u8> {
     out
 }
 
+// FIXME: remove
 pub fn sha256_hash(data: &[u8]) -> Vec<u8> {
     let mut hasher = rust_crypto::sha2::Sha256::new();
     use crate::rust_crypto::digest::Digest;
@@ -201,7 +227,7 @@ const A: fn(CK_ATTRIBUTE_TYPE) -> CK_ATTRIBUTE = CK_ATTRIBUTE::new;
 const SECRET_KEY_LABEL: &str = "softfido-secret-key";
 const TOKEN_COUNTER_LABEL: &str = "softfido-token-counter";
 
-impl KeyStore {
+impl<'a> KeyStore<'a> {
 
     fn find_secret_key(&self) -> Result<Option<CK_OBJECT_HANDLE>, Error> {
         let (ctx, s) = (&self.ctx, self.session);
@@ -234,7 +260,8 @@ impl KeyStore {
     }
 
     fn create_secret_key(&self) -> Result<(), Error> {
-        self.ctx.generate_key(
+        let ctx = self.ctx;
+        ctx.generate_key(
             self.session, &mechanism(CKM_AES_KEY_GEN),
             &vec![A(CKA_CLASS).with_ck_ulong(&CKO_SECRET_KEY),
                   A(CKA_KEY_TYPE).with_ck_ulong(&CKK_AES),
@@ -384,55 +411,118 @@ impl KeyStore {
         Ok(d[1..1+len as usize].to_vec())
     }
 
-    
+    // FIXME: use clock from token
     pub fn create_certificate(&self, wrapped_priv_key: &[u8], pub_key: &[u8],
                               issuer: &str, subject: &str,
                               not_before: DateTime<Utc>, 
                               not_after: Option<DateTime<Utc>>) ->
         Result<Vec<u8>, Error> {
-            let algo = AlgorithmIdentifier{ oid: SECP256R1_OID };
+            let sig_algo = EcdsaWithSha256 {};
             let (tbs_cert, _pos) = cookie_factory::gen(
                 x509::write::tbs_certificate(
                     &[0],
-                    &algo,
+                    &sig_algo,
                     issuer,
                     not_before, not_after,
                     subject,
-                    &SubjectPublicKeyInfo{algorithm_id: &algo,
-                                          public_key: pub_key}
+                    &EcSubjectPublicKeyInfo{ public_key: pub_key }
                 ),
                 Vec::<u8>::new()).unwrap();
             let sig = self.sign(wrapped_priv_key, &tbs_cert)?;
             let (cert, _pos) = cookie_factory::gen(
-                x509::write::certificate(&tbs_cert, &algo, &sig),
+                x509::write::certificate(&tbs_cert, &sig_algo, &sig),
                 Vec::new()).unwrap();
             Ok(cert)
         }
 }
 
-#[derive(Clone)]
-struct AlgorithmIdentifier {
-    oid: &'static [u64],
-}
+#[derive(Clone)] struct EcPublicKey {}
+#[derive(Clone)] struct EcdsaWithSha256 {}
 
-impl x509::AlgorithmIdentifier for AlgorithmIdentifier {
+impl x509::AlgorithmIdentifier for EcdsaWithSha256 {
     type AlgorithmOid = &'static [u64];
-    fn algorithm(&self) -> &'static [u64] { self.oid }
+    fn algorithm(&self) -> &'static [u64] { OID_ECDSA_WITH_SHA256 }
     fn parameters<W: std::io::Write>(&self, w: cookie_factory::WriteContext<W>)
                                      ->  cookie_factory::GenResult<W> {
         Ok(w)
     }
 }
 
-struct SubjectPublicKeyInfo<'a> {
-    algorithm_id: &'a AlgorithmIdentifier,
+
+impl x509::AlgorithmIdentifier for EcPublicKey {
+    type AlgorithmOid = &'static [u64];
+    fn algorithm(&self) -> &'static [u64] { OID_EC_PUBLIC_KEY }
+    fn parameters<W: std::io::Write>(&self, w: cookie_factory::WriteContext<W>)
+                                     ->  cookie_factory::GenResult<W> {
+        x509::der::write::der_oid(OID_SECP256R1)(w)
+    }
+}
+
+struct EcSubjectPublicKeyInfo<'a> {
     public_key: &'a [u8],
 }
 
-impl<'a> x509::SubjectPublicKeyInfo for SubjectPublicKeyInfo<'a> {
-    type AlgorithmId = AlgorithmIdentifier;
+impl<'a> x509::SubjectPublicKeyInfo for EcSubjectPublicKeyInfo<'a> {
+    type AlgorithmId = EcPublicKey;
     type SubjectPublicKey = &'a [u8];
-    fn algorithm_id (&self) -> AlgorithmIdentifier {
-        self.algorithm_id.clone() }
+    fn algorithm_id (&self) -> Self::AlgorithmId { EcPublicKey{} }
     fn public_key (&self) -> &'a [u8] { self.public_key }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::globals::{with_ctx, R};
+    
+    fn with_token<T> (f: &dyn Fn (&super::KeyStore) -> R<T>) -> R<T> {
+        let lib = "/usr/lib/softhsm/libsofthsm2.so";
+        let home = std::env::var("HOME").unwrap();
+        let pinfile = Some(format!("{}/.password-store/softhsm2/user-pin.gpg",
+                                   home));
+        let label = "softfido";
+        with_ctx(lib, &|ctx| -> R<T> {
+            let token = super::open_token(&ctx, label, &pinfile)?;
+            f(&token)
+        })
+    }
+    
+    #[test]
+    fn open_token () {
+        let _ = with_token(&|_| {Ok(())});
+        let _ = with_token(&|_| {Ok(())});
+        let _ = with_token(&|_| {Ok(())});
+    }
+
+    #[test]
+    // this is run in another thread
+    fn open_token2 () {
+        let _ = with_token(&|_| {Ok(())});
+        let _ = with_token(&|_| {Ok(())});
+        let _ = with_token(&|_| {Ok(())});
+    }
+
+    #[test]
+    fn get_keys() {
+        with_token(&|token| {
+            token.generate_key_pair()?;
+            Ok(())
+        }).unwrap()
+    }
+
+    #[test]
+    fn print_cert() {
+        with_token(&|token| {
+            let (wpriv_key, (x, y)) = token.generate_key_pair()?;
+            let pub_key = [&[4u8][..], &x[..], &y].concat();
+            let not_before = chrono::Utc::now();
+            let not_after = not_before + chrono::Duration::days(30);
+            let cert = token.create_certificate(&wpriv_key, &pub_key,
+                                                "Fakecompany", "Fakecompany",
+                                                not_before, Some(not_after))?;
+            let mut file = std::fs::File::create("/tmp/cert.der")?;
+            use std::io::Write;
+            file.write_all(&cert[..])?;
+            Ok(())
+        }).unwrap()
+    }
+
 }

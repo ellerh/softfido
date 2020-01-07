@@ -34,7 +34,7 @@ pub fn yes_or_no_p(prompt: &str)
     std::thread::spawn(move || {
         let peb = pinentry_rs::pinentry().description(escaped);
         let r = peb.confirm_yes_no();
-        sender.send(r).unwrap()
+        sender.send(r)//.unwrap()
     });
     receiver
 }

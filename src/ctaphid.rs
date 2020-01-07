@@ -21,7 +21,7 @@ pub struct Parser<'a> {
     pub send_queue: VecDeque<Vec<u8>>,
     pub recv_queue: VecDeque<Vec<u8>>,
     max_packet_size: u16,
-    token: &'a crypto::KeyStore,
+    token: &'a crypto::KeyStore<'a>,
     env: Env,
 }
 
@@ -39,6 +39,7 @@ const CTAPHID_BROADCAST_CID: u32 = 0xFFFFFFFF;
 
 const CTAPHID_INIT: u8 = 0x06;
 const CTAPHID_PING: u8 = 0x01;
+const CTAPHID_CANCEL: u8 = 0x11;
 const CTAPHID_CBOR: u8 = 0x10;
 const CTAPHID_MSG: u8 = 0x03;
 const CTAPHID_ERROR: u8 = 0x3F;
@@ -56,10 +57,13 @@ const CTAP2_GET_ASSERTION: u8 = 0x02;
 const STATUS_UPNEEDED: u8 = 2;
 
 const ERR_INVALID_CMD: u8 = 0x01;
+const ERR_INVALID_PAR: u8 = 0x02;
+const ERR_BUSY: u8 = 0x06;
 const ERR_OPERATION_DENIED: u8 = 0x27;
 const ERR_INVALID_CREDENTIAL: u8 = 0x22;
 //const ERR_INVALID_OPTION: u8 = 0x2C;
 const ERR_INVALID_CBOR: u8 = 0x12;
+const ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
 
 const SW_NO_ERROR: u16 = 0x9000;
 const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
@@ -314,13 +318,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_init_packet (&mut self, pkt: &[u8]) -> R<()> {
-        assert!(pkt.len() >= 8);
-        let channel = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
-        let cmd = pkt[4];
-        assert!((cmd >> 7) == 1);
-        let cmd = cmd & !(1 << 7);
-        let bcnt = u16::from_be_bytes([pkt[5],pkt[6]]);
-        let data = &pkt[7..min(pkt.len(), 7 + (bcnt as usize))];
+        let (channel, cmd, bcnt, data) = Self::parse_packet(pkt);
         if data.len() == bcnt as usize {
             self.process_message(channel, cmd, data)
         } else {
@@ -336,8 +334,20 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_cont_packet (&mut self, pkt: &[u8])
-                          -> R<()> {
+    // FIXME: return None in case of error
+    fn parse_packet(pkt: &[u8]) -> (u32, u8, u16, &[u8]) {
+        assert!(pkt.len() >= 8);
+        let channel = u32::from_le_bytes([pkt[0], pkt[1],
+                                          pkt[2], pkt[3]]);
+        let cmd = pkt[4];
+        assert!((cmd >> 7) == 1);
+        let cmd = cmd & !(1 << 7);
+        let bcnt = u16::from_be_bytes([pkt[5],pkt[6]]);
+        let data = &pkt[7..min(pkt.len(), 7 + (bcnt as usize))];
+        (channel, cmd, bcnt, data)
+    }
+
+    fn parse_cont_packet (&mut self, pkt: &[u8]) -> R<()> {
         assert!(pkt.len() > 5);
         let channel = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
         assert!(channel == self.channel);
@@ -370,10 +380,8 @@ impl<'a> Parser<'a> {
             CTAPHID_INIT => self.init_cmd (channel, data),
             CTAPHID_PING => self.ping_cmd (channel, data),
             CTAPHID_CBOR => self.cbor_cmd (channel, data),
-            // CTAPHID_CBOR => {
-            //     return self.send_error (channel, ERR_INVALID_CMD)
-            // }
             CTAPHID_MSG => self.msg_cmd(channel, data),
+            CTAPHID_CANCEL => Ok(()), // Ignored, as per spec.
             _ => {
                 let _ = self.send_error (channel, ERR_INVALID_CMD);
                 panic!("Command nyi: {}", cmd)
@@ -440,8 +448,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn send_error(&mut self, channel: u32, data: u8) ->
-        R<()> {
+    fn send_error(&mut self, channel: u32, data: u8) -> R<()> {
             log!("send_error: {}", data);
             self.send_reply(channel, CTAPHID_ERROR, &[data]);
             Ok(())
@@ -460,7 +467,7 @@ impl<'a> Parser<'a> {
             device_major_version: 0,
             device_minor_version: 0,
             device_build_version: 0,
-            capabilities: CAPABILITY_CBOR|CAPABILITY_NMSG,
+            capabilities: CAPABILITY_CBOR & !CAPABILITY_NMSG,
         };
         self.send_queue.push_back(Vec::from(&response.pack()[..]));
         Ok(())
@@ -499,8 +506,7 @@ impl<'a> Parser<'a> {
             Ok(args) => args,
             Err(err) => {
                 log!("can't parse make_credential args: {}", err);
-                self.send_reply(channel, CTAPHID_CBOR, &[ERR_INVALID_CBOR]);
-                return Ok(())
+                return self.send_cbor_error(channel, ERR_INVALID_CBOR);
             }
         };
         log!("CTAP2_MAKE_CREDENTIAL 0x{:x} {}", channel, args.rp.id);
@@ -534,11 +540,8 @@ Allow? ",
         };
         let r = match consent.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(true)) => self.make_credential_3(),
-            Ok(Ok(false)) | Err(RecvTimeoutError::Disconnected) => {
-                self.send_reply (channel, CTAPHID_CBOR,
-                                 &[ERR_OPERATION_DENIED]);
-                Ok(())
-            },
+            Ok(Ok(false)) | Err(RecvTimeoutError::Disconnected) =>
+                self.send_cbor_error (channel, ERR_OPERATION_DENIED),
             Ok(Err(e)) => panic!("Receive consent: {:?}", e),
             Err(RecvTimeoutError::Timeout) => {
                 self.send_reply(channel, CTAPHID_KEEPALIVE,
@@ -597,20 +600,49 @@ Allow? ",
         Ok(())
     }
 
-    fn make_credential_cont (&mut self, pkt: &[u8])
-                             -> R<()> {
+    fn make_credential_cont (&mut self, pkt: &[u8]) -> R<()> {
         log!("make_credential_cont");
-        assert!(pkt.len() == 0);
-        self.make_credential_2()
+        match pkt.len() {
+            0 => self.make_credential_2(),
+            _ => match Self::parse_packet(pkt) {
+                (channel, CTAPHID_CANCEL, 0, _data) =>
+                    self.make_credential_cancel(channel),
+                (_channel, cmd, bcnt, data) =>
+                    panic!("unexpected pkg: cmd: {:x} bcnt: {} data: {:?}",
+                           cmd, bcnt, data)
+            }
+        }
     }
 
+    fn make_credential_cancel (&mut self, channel: u32) -> R<()> {
+        let (chan, _consent) = match &self.env {
+            Env::MakeCredential{ channel, consent, .. } => (*channel, consent),
+            _ => panic!()
+        };
+        assert!(chan == channel);
+        let r = self.send_cbor_error (channel, ERR_KEEPALIVE_CANCEL); 
+        self.state = Parser::parse_init_packet;
+        self.env = Env::None;
+        r
+    }
+    
     fn get_assertion (&mut self, channel: u32, cbor: &[u8])
                       -> R<()> {
-        let args: GetAssertionArgs = serde_cbor::from_slice(cbor).unwrap();
+        let args: GetAssertionArgs = match serde_cbor::from_slice(cbor) {
+            Ok(x) => x,
+            Err(e) => {
+                log!("failed to parse cbor: {}", e);
+                return self.send_error(channel, ERR_INVALID_PAR)
+            }
+        };
         log!("get_assertion 0x{:x} {:?}", channel, args);
         assert!(args.allow_list.len() == 1);
-        let credential_id = serde_cbor::from_slice::<CredentialId>
-            (&args.allow_list[0].id.0).unwrap();
+        let credential_id: CredentialId = match serde_cbor::from_slice
+            (&args.allow_list[0].id.0) {
+                Ok(x) => x,
+                Err(_) => return self.send_cbor_error(channel,
+                                                      ERR_INVALID_CREDENTIAL)
+            };
         match (self.token.decrypt(&credential_id.encrypted_rp_id.0),
                args.rp_id.as_bytes()) {
             (Ok(id1), id2) if id1 == id2 => (),
@@ -648,11 +680,8 @@ Allow?",
         };
         let r = match consent.recv_timeout(Duration::from_millis(500)) {
             Ok(Ok(true)) => self.get_assertion_3(),
-            Ok(Ok(false)) | Err(RecvTimeoutError::Disconnected) => {
-                self.send_reply (channel, CTAPHID_CBOR,
-                                 &[ERR_OPERATION_DENIED]);
-                Ok(())
-            },
+            Ok(Ok(false)) | Err(RecvTimeoutError::Disconnected) =>
+                self.send_cbor_error (channel, ERR_OPERATION_DENIED),
             Ok(Err(e)) => panic!("Receive consent: {:?}", e),
             Err(RecvTimeoutError::Timeout) => {
                 self.send_reply(channel, CTAPHID_KEEPALIVE,
@@ -771,11 +800,11 @@ Allow?",
                                           challenge,
                                           &key_handle,
                                           &pub_key,].concat())?;
-        let now = chrono::Utc::now();
-        let not_after = now + chrono::Duration::days(30);
-        let cert = &self.token.create_certificate(&wpriv, &pub_key,
-                                                  "Fakecompany", "Fakeompany",
-                                                  now, Some(not_after))?;
+        let not_before = chrono::Utc::now();
+        let not_after = not_before + chrono::Duration::days(30);
+        let cert = self.token.create_certificate(&wpriv, &pub_key,
+                                                 "Fakecompany", "Fakecompany",
+                                                 not_before, Some(not_after))?;
         let result = [&[5u8][..], // reserved byte 5
                       &pub_key,
                       &[key_handle.len() as u8],
@@ -795,18 +824,27 @@ Allow?",
         let l = data[64];
         let key_handle = &data[65..];
         assert!(key_handle.len() == l as usize);
-        let credential_id = serde_cbor::from_slice::<CredentialId>
-            (key_handle).unwrap();
+        let credential_id: CredentialId =
+            match serde_cbor::from_slice (key_handle) {
+                Ok(x) => x,
+                _ => {
+                    self.send_reply(channel, CTAPHID_MSG,
+                                    &SW_WRONG_DATA.to_be_bytes());
+                    return Ok(())
+                }
+            };
         println!("credential_id = {:?}", &credential_id);
         println!("application: {:?}", &application);
         let wpriv = &credential_id.wrapped_private_key.0;
         assert!(self.token.is_valid_id(wpriv));
-        if application !=
-            &self.token.decrypt(&credential_id.encrypted_rp_id.0)?[..] {
-            self.send_reply(channel, CTAPHID_MSG,
-                            &SW_WRONG_DATA.to_be_bytes());
-            return Ok(())
-        }
+        match self.token.decrypt(&credential_id.encrypted_rp_id.0) {
+            Ok(rp_id) if rp_id == application => (),
+            _ => {
+                self.send_reply(channel, CTAPHID_MSG,
+                                &SW_WRONG_DATA.to_be_bytes());
+                return Ok(())
+            }
+        };
         match control {
             7 => {
                 let code = SW_CONDITIONS_NOT_SATISFIED;

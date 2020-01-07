@@ -5,6 +5,7 @@ extern crate crypto as rust_crypto;
 
 #[macro_use] extern crate packed_struct_codegen;
 #[macro_use] mod macros;
+#[macro_use] extern crate lazy_static;
 
 mod usbip;
 mod hid;
@@ -26,18 +27,21 @@ struct Args {
 
 fn main() {
     let args = parse_args();
-    let token = match crypto::open_token(
-        std::path::Path::new(&args.pkcs11_module),
-        &args.token_label, &args.pin_file) {
-        Ok(x) => x,
-        Err(err) => panic!("Failed to open token: {}", err)
-    };
-    let listener = TcpListener::bind("192.168.178.22:3240").unwrap();
-    println!("USBIP Testserver");
-    for s in listener.incoming() {
-        println!("New connection {:?}\n", s);
-        handle_stream(&mut s.unwrap(), &token).unwrap();
-    }
+    crypto::globals::with_ctx(&args.pkcs11_module,&|ctx| {
+        let token = match crypto::open_token(
+            &ctx,
+            &args.token_label, &args.pin_file) {
+            Ok(x) => x,
+            Err(err) => panic!("Failed to open token: {}", err)
+        };
+        let listener = TcpListener::bind("192.168.178.22:3240").unwrap();
+        println!("USBIP Testserver");
+        for s in listener.incoming() {
+            println!("New connection {:?}\n", s);
+            handle_stream(&mut s.unwrap(), &token).unwrap();
+        };
+        Ok(())
+    }).unwrap();
 }
 
 fn default_args() -> Args {
