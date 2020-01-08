@@ -238,9 +238,9 @@ class Tests(unittest.TestCase):
     def test_multichannel(self):
         dev1 = open_ctaphid_device()
         dev2 = open_ctaphid_device()
+        client2 = fido2.client.Fido2Client(dev2, "https://example2.com")
         client1 = fido2.client.Fido2Client(dev1, "https://example1.com")
         rp1 = {'id': 'example1.com', 'name': 'Example RP'}
-        client2 = fido2.client.Fido2Client(dev2, "https://example2.com")
         rp2 = {'id': 'example2.com', 'name': 'Example RP'}
         user = {'id': b'user_id', 'name': 'A. User'}
         pin = None

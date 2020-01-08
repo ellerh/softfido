@@ -299,7 +299,7 @@ impl<'a> Device<'a> {
                 "Default Config",
                 "The Interface",
             ],
-            parser: ctaphid::Parser::new(64, token),
+            parser: ctaphid::Parser::new(token),
         }
     }
 
