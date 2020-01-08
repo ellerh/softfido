@@ -298,16 +298,9 @@ impl<'a> Parser<'a> {
     pub fn new (token: &'a crypto::KeyStore) -> Self {
         Self {
             channels: vec![],
-            // cmd: 0,
-            // bcnt: 0,
-            // buffer: Vec::<u8>::with_capacity(4096),
-            //seqnum: 0,
-            //state: State::Init,
             send_queue: VecDeque::new(),
             recv_queue: VecDeque::new(),
             token: token,
-            //env: Env::None,
-            //channels: vec!()
         }
     }
 
@@ -343,7 +336,8 @@ impl<'a> Parser<'a> {
                     match channel.state {
                         State::MakeCredential{..} |
                         State::GetAssertion{..} => {
-                            //assert!(self.recv_queue.is_empty());
+                            assert!(self.recv_queue.len() <
+                                    self.channels.len());
                             self.recv_queue.push_front(
                                 [&channel.cid.to_le_bytes()[..],
                                  &[HACK_CHECK_STATUS|1<<7, 0, 0][..]]
@@ -395,14 +389,14 @@ impl<'a> Parser<'a> {
 
 }
 
-fn send_reply(queue: &mut Q, channel: u32, cmd: u8, data: &[u8]) {
+fn send_reply(queue: &mut Q, channel: u32, cmd: u8, data: &[u8]) -> R<()> {
     let mut reply = u32::to_le_bytes(channel).to_vec();
     reply.push(cmd | (1 << 7));
     reply.extend_from_slice(&u16::to_be_bytes(data.len() as u16));
     let init_max = MAX_PACKET_SIZE as usize - 7;
     if data.len() < init_max {
         reply.extend_from_slice(data);
-        queue.push_back(reply)
+        queue.push_back(reply);
     } else {
         reply.extend_from_slice(&data[0..init_max]);
         queue.push_back(reply);
@@ -413,9 +407,10 @@ fn send_reply(queue: &mut Q, channel: u32, cmd: u8, data: &[u8]) {
                 assert!(i < 0x7f);
                 cont.push(i as u8);
                 cont.extend_from_slice(chunk);
-                queue.push_back(cont)
+                queue.push_back(cont);
             })
-    }
+    };
+    Ok(())
 }
 
 impl<'a> Channel<'a> {
@@ -506,11 +501,7 @@ impl<'a> Channel<'a> {
 
     fn ping_cmd(&mut self, data: &[u8], q: &mut Q) -> R<()> {
         log!("ping_cmd data: {}", String::from_utf8_lossy(&data));
-        // let secs = 30;
-        // println!("sleeping {} secs ...", secs);
-        // std::thread::sleep(std::time::Duration::from_secs(secs));
-        send_reply(q, self.cid, CTAPHID_PING, data);
-        Ok(())
+        send_reply(q, self.cid, CTAPHID_PING, data)
     }
 
     fn cbor_cmd(&mut self, data: &[u8], q: &mut Q) -> R<()> {
@@ -527,9 +518,8 @@ impl<'a> Channel<'a> {
     }
 
     fn send_error(&mut self, data: u8, q: &mut Q) -> R<()> {
-            log!("send_error: {}", data);
-            send_reply(q, self.cid, CTAPHID_ERROR, &[data]);
-            Ok(())
+        log!("send_error: {}", data);
+        send_reply(q, self.cid, CTAPHID_ERROR, &[data])
     }
 
     fn get_info (&mut self, cbor: &[u8], q: &mut Q) -> R<()> {
@@ -549,13 +539,11 @@ impl<'a> Channel<'a> {
         let status = CTAP1_ERR_SUCCESS;
         let mut data = vec!(status);
         data.extend_from_slice(cbor);
-        send_reply(q, self.cid, CTAPHID_CBOR, &data);
-        Ok(())
+        send_reply(q, self.cid, CTAPHID_CBOR, &data)
     }
     
     fn send_cbor_error(&mut self, error: u8, q: &mut Q) -> R<()> {
-        send_reply(q, self.cid, CTAPHID_CBOR, &[error]);
-        Ok(())
+        send_reply(q, self.cid, CTAPHID_CBOR, &[error])
     }
 
     fn make_credential (&mut self, cbor: &[u8], q: &mut Q) -> R<()> {
@@ -597,11 +585,9 @@ Allow? ",
             Ok(Ok(false)) | Err(RecvTimeoutError::Disconnected) =>
                 self.send_cbor_error (ERR_OPERATION_DENIED, q),
             Ok(Err(e)) => panic!("Receive consent: {:?}", e),
-            Err(RecvTimeoutError::Timeout) => {
-                send_reply(q, self.cid, CTAPHID_KEEPALIVE,
-                           &[STATUS_UPNEEDED][..]);
-                return Ok(())
-            },
+            Err(RecvTimeoutError::Timeout) => 
+                return send_reply(q, self.cid, CTAPHID_KEEPALIVE,
+                                  &[STATUS_UPNEEDED][..]),
         };
         self.state = State::Init;
         r
@@ -689,15 +675,6 @@ Allow? ",
             (Ok(id1), id2) if id1 == id2 => (),
             _ => return self.send_cbor_error(ERR_INVALID_CREDENTIAL, q),
         };
-        // let wrapped_priv = &credential_id[..WRAPPED_PRIVATE_KEY_LEN];
-        // if !self.token.is_valid_id(wrapped_priv) {
-        //     self.send_reply(channel, CTAPHID_CBOR, &[ERR_INVALID_CREDENTIAL]);
-        //     return Ok(())//self.send_error (channel, ERR_INVALID_CREDENTIAL)
-        // };
-        // if args.options.up == false {
-        //     println!("args.options.up == false");
-        //     return self.send_error (channel, ERR_INVALID_OPTION)
-        // };
         let prompt = format!(
             "Consent needed for signing challange
 
@@ -722,11 +699,9 @@ Allow?",
             Ok(Ok(false)) | Err(RecvTimeoutError::Disconnected) =>
                 self.send_cbor_error (ERR_OPERATION_DENIED, q),
             Ok(Err(e)) => panic!("Receive consent: {:?}", e),
-            Err(RecvTimeoutError::Timeout) => {
-                send_reply(q, self.cid, CTAPHID_KEEPALIVE,
-                           &[STATUS_UPNEEDED][..]);
-                return Ok(())
-            },
+            Err(RecvTimeoutError::Timeout) =>
+                return send_reply(q, self.cid, CTAPHID_KEEPALIVE,
+                                  &[STATUS_UPNEEDED][..]),
         };
         self.state = State::Init;
         r
@@ -802,8 +777,7 @@ Allow?",
         let data: Vec<u8> = ["U2F_V2".as_bytes(),
                              &SW_NO_ERROR.to_be_bytes()].concat();
         log!("u2f_version => {:?}", &data);
-        send_reply(q, self.cid, CTAPHID_MSG, &data);
-        Ok(())
+        send_reply(q, self.cid, CTAPHID_MSG, &data)
     }
 
     fn u2f_register(&mut self, data: &[u8], q: &mut Q) -> R<()> {
@@ -816,11 +790,9 @@ Allow?",
             Ok(Ok(true)) => (),
             Ok(Ok(false)) |
             Err(RecvTimeoutError::Disconnected) |
-            Err(RecvTimeoutError::Timeout) => {
-                send_reply(q, self.cid, CTAPHID_MSG,
-                           &SW_CONDITIONS_NOT_SATISFIED.to_be_bytes());
-                return Ok(())
-            },
+            Err(RecvTimeoutError::Timeout) => 
+                return send_reply(q, self.cid, CTAPHID_MSG,
+                                  &SW_CONDITIONS_NOT_SATISFIED.to_be_bytes()),
             Ok(Err(e)) => panic!("Receive consent: {:?}", e),
         }
         let (wpriv, (x, y)) = self.token.generate_key_pair()?;
@@ -852,8 +824,7 @@ Allow?",
                       &cert,
                       &signature,
                       &SW_NO_ERROR.to_be_bytes()].concat();
-        send_reply(q, self.cid, CTAPHID_MSG, &result);
-        Ok(())
+        send_reply(q, self.cid, CTAPHID_MSG, &result)
     }
 
     fn u2f_authenticate(&mut self, control: u8, data: &[u8], q: &mut Q)
@@ -867,11 +838,8 @@ Allow?",
         let credential_id: CredentialId =
             match serde_cbor::from_slice (key_handle) {
                 Ok(x) => x,
-                _ => {
-                    send_reply(q, self.cid, CTAPHID_MSG,
-                               &SW_WRONG_DATA.to_be_bytes());
-                    return Ok(())
-                }
+                _ => return send_reply(q, self.cid, CTAPHID_MSG,
+                                       &SW_WRONG_DATA.to_be_bytes()),
             };
         println!("credential_id = {:?}", &credential_id);
         println!("application: {:?}", &application);
@@ -879,11 +847,8 @@ Allow?",
         assert!(self.token.is_valid_id(wpriv));
         match self.token.decrypt(&credential_id.encrypted_rp_id.0) {
             Ok(rp_id) if rp_id == application => (),
-            _ => {
-                send_reply(q, self.cid, CTAPHID_MSG,
-                           &SW_WRONG_DATA.to_be_bytes());
-                return Ok(())
-            }
+            _ => return send_reply(q, self.cid, CTAPHID_MSG,
+                                   &SW_WRONG_DATA.to_be_bytes()),
         };
         match control {
             7 => {
@@ -897,9 +862,9 @@ Allow?",
                     Ok(Ok(false)) |
                     Err(RecvTimeoutError::Disconnected) |
                     Err(RecvTimeoutError::Timeout) => {
-                        send_reply(q, self.cid, CTAPHID_MSG,
-                                   &SW_CONDITIONS_NOT_SATISFIED.to_be_bytes());
-                        return Ok(())
+                        return send_reply(q, self.cid, CTAPHID_MSG,
+                                          &SW_CONDITIONS_NOT_SATISFIED
+                                          .to_be_bytes())
                     },
                     Ok(Err(e)) => panic!("Receive consent: {:?}", e),
                 }
@@ -919,7 +884,6 @@ Allow?",
             }
             _ => panic!("control byte 0x{:0x} nyi", control),
         }
-        Ok(())
     }
 
 }
