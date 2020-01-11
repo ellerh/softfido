@@ -48,7 +48,7 @@ is not installed in /usr/lib/softhsm/libsofthsm2.so.
 Insert the vhci-hcd module with:
 ```modprobe vhci-hcd```
 
-Connet the kernel module to the server:
+Connect the kernel module to the server:
 ```usbip attach -r 127.0.0.1 -d 1-1```
 
 After that `lsusb -d 0:0 -v` should describe the virtual USB device.
@@ -70,7 +70,7 @@ SUBSYSTEM=="hidraw", ATTRS{manufacturer}=="Fakecompany", \
 
 The `python/` directory contains some (interactive) tests. You can run
 them with ```python3 softfido_tests.py```.  The tests require the
-[`fido2`](https://pypi.org/project/fido2/) Python module.
+[`fido2` Python module](https://pypi.org/project/fido2/).
 
 ## Test in browser
 
@@ -78,10 +78,10 @@ You can test the authenticator on [Yubico's test
 page](https://demo.yubico.com/webauthn-technical/registration) or
 [webauthn.io](https://webauthn.io/).
 
-At the time of writing, Firefox only supports U2F but not FIDO2.
-Chromium supports both.  In my experience, the only website that uses
-FIDO2 when available is github.com; all others use U2F even if the
-device and the browser would support FIDO2.
+At the time of writing, Firefox supports U2F but not FIDO2.  Chromium
+supports both.  In my experience, the only website that uses FIDO2
+when available is github.com; all others use U2F even if the device
+and the browser would support FIDO2.
 
 # Webauthn with a TPM
 
@@ -93,11 +93,11 @@ Gadget](https://www.kernel.org/doc/html/latest/usb/gadget_hid.html)
 machinery, which would probably have been a bit easier than USBIP.
 OTOH, with USBIP the authenticator can run on a different machine than
 the kernel module which is useful to sidestep kernel bugs.  During
-development I had a few kernel crashes. After debugging my code, the
-only kernel related issue that I'm aware off is that the kernel cannot
-properly hibernate as long as the virtual device is connected.
-Removing the kernel module `rmmod vhci-hcd` before hibernating is
-advisable.
+development I had a few kernel crashes/lockups. After debugging my
+code, the only kernel related issue that I'm aware off is that the
+kernel cannot properly hibernate as long as the virtual device is
+connected.  Removing the kernel module `rmmod vhci-hcd` before
+hibernating is advisable.
 
 # Caution
 
