@@ -55,7 +55,7 @@ After that `lsusb -d 0:0 -v` should describe the virtual USB device.
 `ls -l /sys/class/hidraw/` should also list a link to a vhci_hcd
 device.
 
-## Device mermissions
+## Device permissions
 
 To allow non-root users to open the virtual hidraw device, its
 permissions must be setup accordingly.  This can be done manually with
