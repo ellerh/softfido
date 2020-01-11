@@ -27,6 +27,11 @@ struct Args {
 fn main() {
     let args = parse_args();
     crypto::globals::with_ctx(&args.pkcs11_module,&|ctx| {
+        let ctx = match ctx {
+            Ok(ctx) => ctx,
+            Err(e) => panic!("Failed to load pckcs11_module: {} {:?}",
+                             e, e)
+        };
         let token = match crypto::open_token(
             &ctx,
             &args.token_label, &args.pin_file) {

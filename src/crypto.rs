@@ -86,13 +86,15 @@ pub mod globals {
 
     pub type R<T> = Result<T, Box<dyn std::error::Error>>;
 
-    pub fn with_ctx<T> (module: &str, f: &dyn Fn (&Ctx) -> R<T>) -> R<T> {
+    pub fn with_ctx<T> (module: &str, f: &dyn Fn (R<&Ctx>) -> R<T>) -> R<T> {
         let mut lock = LOCK.lock().unwrap();
         let path = Path::new(module);
         assert!(*lock == 0);
         *lock = *lock + 1;
-        let ctx = Ctx::new_and_initialize(path)?;
-        let r = f(&ctx);
+        let r = match Ctx::new_and_initialize(path) {
+            Ok(ctx) => f(Ok(&ctx)),
+            Err(e) => f(Err(Box::new(e))),
+        };
         *lock = *lock - 1;
         assert!(*lock == 0);
         r
@@ -470,6 +472,7 @@ mod tests {
                                    home));
         let label = "softfido";
         with_ctx(lib, &|ctx| -> R<T> {
+            let ctx = ctx.unwrap();
             let token = super::open_token(&ctx, label, &pinfile)?;
             f(&token)
         })
