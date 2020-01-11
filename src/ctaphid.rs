@@ -35,22 +35,6 @@ enum State {
                   consent: Receiver<Result<bool, pinentry_rs::Error>>},
 }
 
-// struct Channel<'a> {
-//     id: u32,
-//     parser: &'a mut Parser<'a>,
-//     state: Box<dyn Fn(&mut Channel<'a>, &[u8]) -> R<()>>
-// }
-
-// enum Env {
-//     MakeCredential{channel:u32,
-//                    args: MakeCredentialArgs,
-//                    consent: Receiver<Result<bool, pinentry_rs::Error>>},
-//     GetAssertion{channel:u32,
-//                  args: GetAssertionArgs,
-//                  consent: Receiver<Result<bool, pinentry_rs::Error>>},
-//     None,
-// }
-
 const MAX_PACKET_SIZE: u16 = 64;
 
 const CTAPHID_BROADCAST_CID: u32 = 0xFFFFFFFF;
@@ -332,12 +316,13 @@ impl<'a> Parser<'a> {
                 log!("unparse");
                 assert!(r.len() <= pkt.len());
                 pkt[..r.len()].copy_from_slice(&r[..]);
+                let mut n = 0;
                 for channel in &self.channels {
                     match channel.state {
                         State::MakeCredential{..} |
                         State::GetAssertion{..} => {
-                            assert!(self.recv_queue.len() <
-                                    self.channels.len());
+                            assert!(self.recv_queue.len() == n);
+                            n = n + 1;
                             self.recv_queue.push_front(
                                 [&channel.cid.to_le_bytes()[..],
                                  &[HACK_CHECK_STATUS|1<<7, 0, 0][..]]
@@ -351,16 +336,16 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn init_cmd(&mut self, channel: u32, pkt: &[u8]) -> R<()> {
+    fn init_cmd(&mut self, cid: u32, pkt: &[u8]) -> R<()> {
         log!("init_cmd");
         let bcnt = u16::from_be_bytes([pkt[5],pkt[6]]);
         let data = &pkt[7..min(pkt.len(), 7 + (bcnt as usize))];
         assert!(data.len() == 8);
         let nonce = u64::from_le_bytes([data[0], data[1], data[2], data[3],
                                         data[4], data[5], data[6], data[7],]);
-        match channel {
+        match cid {
             CTAPHID_BROADCAST_CID => self.allocate_channel(nonce),
-            _ => panic!("init_channel nyi: {}", channel)
+            _ => panic!("init_channel nyi: {}", cid)
         }
     }
     
@@ -389,8 +374,8 @@ impl<'a> Parser<'a> {
 
 }
 
-fn send_reply(queue: &mut Q, channel: u32, cmd: u8, data: &[u8]) -> R<()> {
-    let mut reply = u32::to_le_bytes(channel).to_vec();
+fn send_reply(queue: &mut Q, cid: u32, cmd: u8, data: &[u8]) -> R<()> {
+    let mut reply = u32::to_le_bytes(cid).to_vec();
     reply.push(cmd | (1 << 7));
     reply.extend_from_slice(&u16::to_be_bytes(data.len() as u16));
     let init_max = MAX_PACKET_SIZE as usize - 7;
@@ -403,7 +388,7 @@ fn send_reply(queue: &mut Q, channel: u32, cmd: u8, data: &[u8]) -> R<()> {
         let cont_max = MAX_PACKET_SIZE as usize - 5;
         data[init_max..].chunks(cont_max).enumerate()
             .for_each(|(i, chunk)| {
-                let mut cont = u32::to_le_bytes(channel).to_vec();
+                let mut cont = u32::to_le_bytes(cid).to_vec();
                 assert!(i < 0x7f);
                 cont.push(i as u8);
                 cont.extend_from_slice(chunk);
@@ -429,13 +414,13 @@ impl<'a> Channel<'a> {
     // FIXME: return None in case of error
     fn parse_packet(pkt: &[u8]) -> (u32, u8, u16, &[u8]) {
         assert!(pkt.len() >= 7);
-        let channel = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
+        let cid = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
         let cmd = pkt[4];
         assert!((cmd >> 7) == 1);
         let cmd = cmd & !(1 << 7);
         let bcnt = u16::from_be_bytes([pkt[5],pkt[6]]);
         let data = &pkt[7..min(pkt.len(), 7 + (bcnt as usize))];
-        (channel, cmd, bcnt, data)
+        (cid, cmd, bcnt, data)
     }
 
     fn init_state (&mut self, pkt: &[u8], q: &mut Q) -> R<()> {
@@ -580,7 +565,7 @@ Allow? ",
             State::MakeCredential{ consent, .. } => consent,
             _ => panic!()
         };
-        let r = match consent.recv_timeout(Duration::from_millis(500)) {
+        let r = match consent.recv_timeout(Duration::from_millis(200)) {
             Ok(Ok(true)) => self.make_credential_3(q),
             Ok(Ok(false)) | Err(RecvTimeoutError::Disconnected) =>
                 self.send_cbor_error (ERR_OPERATION_DENIED, q),
@@ -602,7 +587,7 @@ Allow? ",
             wrapped_private_key: Bytes(wrapped_priv_key.to_vec()),
             encrypted_rp_id: Bytes(self.token.encrypt(&rp_id)?),
         })?;
-        Ok([&crypto::sha256_hash(rp_id)[..],
+        Ok([&self.token.sha256_hash(rp_id)?[..],
             &[flags],
             &counter.to_be_bytes(),
             &AAGUID.to_le_bytes(),
@@ -694,7 +679,7 @@ Allow?",
             State::GetAssertion{ consent, .. } => consent,
             _ => panic!()
         };
-        let r = match consent.recv_timeout(Duration::from_millis(500)) {
+        let r = match consent.recv_timeout(Duration::from_millis(200)) {
             Ok(Ok(true)) => self.get_assertion_3(q),
             Ok(Ok(false)) | Err(RecvTimeoutError::Disconnected) =>
                 self.send_cbor_error (ERR_OPERATION_DENIED, q),
@@ -717,7 +702,7 @@ Allow?",
         let wpriv_key = &credential_id.wrapped_private_key.0;
         let counter = self.token.increment_token_counter()?;
         let auth_data: Vec<u8> = [
-            &crypto::sha256_hash(args.rp_id.as_bytes())[..],
+            &self.token.sha256_hash(args.rp_id.as_bytes())?[..],
             &vec!(1<<0|  // User Present (UP) result
                   0<<6), // Attested credential data included (AT).
             &counter.to_be_bytes(),
@@ -740,11 +725,15 @@ Allow?",
         log!("get_assertion_state");
         match Self::parse_packet(pkt) {
             (_, HACK_CHECK_STATUS, 0, _) => self.get_assertion_2(q),
-            //(_, CTAPHID_CANCEL, 0, _) => self.get_credential_cancel(q),
+            (_, CTAPHID_CANCEL, 0, _) => self.get_assertion_cancel(q),
             (_cid, cmd, bcnt, data) =>
                 panic!("unexpected pkg: cmd: {:x} bcnt: {} data: {:?}",
                        cmd, bcnt, data)
         }
+    }
+
+    fn get_assertion_cancel (&mut self, q: &mut Q) -> R<()> {
+        self.make_credential_cancel(q) // does the same
     }
 
     fn msg_cmd(&mut self, data: &[u8], q: &mut Q) -> R<()> {

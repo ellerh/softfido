@@ -203,16 +203,6 @@ fn der_encode_signature (points: &[u8]) -> Vec<u8> {
     out
 }
 
-// FIXME: remove
-pub fn sha256_hash(data: &[u8]) -> Vec<u8> {
-    let mut hasher = rust_crypto::sha2::Sha256::new();
-    use crate::rust_crypto::digest::Digest;
-    hasher.input(data);
-    let mut result = vec!(0; hasher.output_bytes());
-    hasher.result(&mut result);
-    result
-}
-
 // shorthand for mechanism without paramaters.
 fn mechanism(mechanism: CK_MECHANISM_TYPE) -> CK_MECHANISM {
     CK_MECHANISM {
@@ -370,7 +360,7 @@ impl<'a> KeyStore<'a> {
     pub fn sign(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
         let (ctx, s) = (&self.ctx, self.session);
         let hash = self.sha256_hash(&data)?;
-        assert!(hash == sha256_hash(data));
+        //assert!(hash == sha256_hash(data));
         let wrapping_key = self.find_secret_key()?.unwrap();
         let private_key = ctx.unwrap_key(
             s, &mechanism(CKM_AES_KEY_WRAP_PAD),

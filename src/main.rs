@@ -1,7 +1,6 @@
 extern crate packed_struct;
 extern crate serde_cbor;
 extern crate pkcs11;
-extern crate crypto as rust_crypto;
 
 #[macro_use] extern crate packed_struct_codegen;
 #[macro_use] mod macros;

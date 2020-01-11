@@ -41,14 +41,14 @@ def test_make_credential():
     def on_keepalive (status):
         print("on_keepalive: ", status)
     return open_ctap().make_credential(b'hash', rp, user, key_params,
-                                on_keepalive=on_keepalive)
+                                       on_keepalive=on_keepalive)
 
 def test_timeout():
     return open_ctap().make_credential(b'hash',
                                        {'id': "timeout.com",
                                         'name': "Please don't confirm"},
                                        user, key_params,
-                                       timeout=1)
+                                       timeout=0.1)
 
 def test_failed_assertion():
     client_data_hash = a2b_hex(
@@ -134,7 +134,12 @@ class Tests(unittest.TestCase):
         self.assertIsInstance(test_make_credential(), ctap2.AttestationObject)
 
     def test_timeout(self):
-        self.assertRaises(fido2.ctap.CtapError, test_timeout)
+        try:
+            test_timeout()
+        except Exception as e:
+            self.assertIsInstance(e, fido2.ctap.CtapError)
+            self.assertEqual(e.code,
+                             fido2.ctap.CtapError.ERR.INVALID_COMMAND)
 
     def test_failed_assertion (self):
         try:
@@ -268,6 +273,33 @@ class Tests(unittest.TestCase):
                 verifier().verify(attestation_object.att_statement,
                                   attestation_object.auth_data,
                                   client_data.hash)
+
+    def test_timeout_get_assertion (self):
+        dev = open_ctaphid_device()
+        client = fido2.client.Fido2Client(dev, "https://example.com")
+        rp = {'id': 'example.com', 'name': 'Example RP'}
+        user = {'id': b'user_id', 'name': 'A. User'}
+        pin = None
+        challenge1 = 'Y2hhbGxlbmdl'
+        attestation_object, client_data = client.make_credential(
+            rp, user, challenge1, pin=pin)
+        verifier = fido2.attestation.Attestation.for_type(
+            attestation_object.fmt)
+        verifier().verify(attestation_object.att_statement,
+                          attestation_object.auth_data,
+                          client_data.hash)
+        credential = attestation_object.auth_data.credential_data
+        challenge2 = 'Q0hBTExFTkdF'  # Use a new challenge for each call.
+        allow_list = [{
+            'type': 'public-key',
+            'id': credential.credential_id
+        }]
+        try:
+            assertions1, client_data1 = client.get_assertion(
+                rp['id'], challenge2, allow_list, pin=pin, timeout=0.1)
+        except Exception as e:
+            self.assertEqual(e.__context__.code,
+                             fido2.ctap.CtapError.ERR.INVALID_COMMAND)
 
 if __name__ == '__main__':
     unittest.main()
