@@ -1,8 +1,8 @@
 use crate::usbip;
-use crate::usbip::bindings::{usbip_header,
-                             USBIP_DIR_IN, USBIP_DIR_OUT,
-                             USBIP_CMD_SUBMIT, USBIP_CMD_UNLINK,
-                             EINPROGRESS, ENOENT,};
+use usbip::bindings::{usbip_header,
+                      USBIP_DIR_IN, USBIP_DIR_OUT,
+                      USBIP_CMD_SUBMIT, USBIP_CMD_UNLINK,
+                      EINPROGRESS, ENOENT};
 use std::convert::TryFrom;
 use std::net::TcpStream;
 use std::io::Read;
@@ -105,13 +105,10 @@ impl<'a, T> EventLoop<'a, T> {
         let transfer_buffer_length =
             usize::try_from(i32::from_be(cmd.transfer_buffer_length))
                 .unwrap();
-        use crate::packed_struct::PackedStruct;
         log!("handle_submit ep: {} {} seqnum: {} transfer: {}",
              endpoint, if dev2host { "dev->host" } else { "host->dev" },
              seqnum, transfer_buffer_length);
-        assert!(transfer_flags & !0x00000200 == 0,
-                "Unsupported transfer_flags: {:?}",
-                usbip::TranfserFlags::unpack(&transfer_flags.to_be_bytes()));
+        assert!(transfer_flags & !usbip::URB_DIR_MASK == 0);
         //println!("transfer_buffer_length: {}", transfer_buffer_length);
         let mut v = vec!(0u8; transfer_buffer_length);
         let h = self.remove_handler(endpoint, dev2host);
@@ -126,7 +123,8 @@ impl<'a, T> EventLoop<'a, T> {
                         println!("Request Error: {} {:?}", err, err);
                         usbip::write_submit_reply_error(stream, header)?;
                         self.handlers.push(Dev2Host(ep, f));
-                        return Err(err)
+                        //return Err(err)
+                        Ok(())
                     },
                     Ok(true) => {
                         usbip::write_submit_reply(stream, header, &v, None)?;

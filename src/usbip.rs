@@ -25,31 +25,14 @@ type R<T> = Result<T, Box<dyn std::error::Error>>;
 pub const USBIP_VERSION: u16 = 0x0111u16;
 const LANG_ID_EN_US: u16 = 0x0409;
 
-#[derive(PackedStruct, Debug)]
-#[packed_struct(endian = "msb", size_bytes = "4", bit_numbering = "lsb0")]
-pub struct TranfserFlags {
-    #[packed_field(bits = "0")]
-    short_not_ok: bool,
-    #[packed_field(bits = "1")]
-    iso_asap: bool,
-    #[packed_field(bits = "2")]
-    no_transfer_data_map: bool,
-    #[packed_field(bits = "6")]
-    zero_packet: bool,
-    #[packed_field(bits = "7")]
-    no_interrupt: bool,
-    #[packed_field(bits = "8")]
-    free_buffer: bool,
-    #[packed_field(bits = "9")]
-    dir_mask: bool,
-    // const URB_SHORT_NOT_OK        = 0x00000001;
-    // const URB_ISO_ASAP            = 0x00000002;
-    // const URB_NO_TRANSFER_DMA_MAP = 0x00000004;
-    // const URB_ZERO_PACKET         = 0x00000040;
-    // const URB_NO_INTERRUPT        = 0x00000080;
-    // const URB_FREE_BUFFER         = 0x00000100;
-    // const URB_DIR_MASK            = 0x00000200;
-}
+// const URB_SHORT_NOT_OK        = 0x00000001;
+// const URB_ISO_ASAP            = 0x00000002;
+// const URB_NO_TRANSFER_DMA_MAP = 0x00000004;
+// const URB_ZERO_PACKET         = 0x00000040;
+// const URB_NO_INTERRUPT        = 0x00000080;
+// const URB_FREE_BUFFER         = 0x00000100;
+pub const URB_DIR_MASK:u32            = 0x00000200;
+
 
 #[derive(PackedStruct, Clone, Copy, Debug)]
 #[packed_struct(endian = "lsb")]
@@ -555,9 +538,6 @@ impl<'a> Device<'a> {
             self.parser.unparse(buf)?;
             Ok(true)
         } else {
-            // let ms = 200;
-            // println!("sleeping {} ms ...", ms);
-            // std::thread::sleep(std::time::Duration::from_millis(ms));
             Ok(false)
         }
     }
@@ -567,21 +547,6 @@ impl<'a> Device<'a> {
         self.parser.recv_queue.push_back(data.to_vec());
         Ok(true)
     }
-
-    // pub fn process_request(
-    //     &mut self,
-    //     endpoint: u8,
-    //     setup: &[u8; 8],
-    //     sink: &mut Write,
-    //     source: &mut Read,
-    // ) -> Result<(), Box<std::error::Error>> {
-    //     match endpoint {
-    //         0 => self.ep0_request(setup, sink),
-    //         1 => self.ep1_request(sink),
-    //         2 => self.ep2_request(source, sink),
-    //         x => panic!("Unsupported endpoint request: {}", x),
-    //     }
-    // }
 
 }
 
@@ -621,7 +586,6 @@ fn usb_device() -> usbip_usb_device {
         busid: [0; 32],
         busnum: 33u32.to_be(),
         devnum: 22u32.to_be(),
-        //speed: 0u32.to_be(),
         speed: 2u32.to_be(),
         idVendor: 0u16.to_be(),
         idProduct: 0u16.to_be(),
@@ -629,8 +593,7 @@ fn usb_device() -> usbip_usb_device {
         bDeviceClass: 0u8.to_be(),
         bDeviceSubClass: 0u8.to_be(),
         bDeviceProtocol: 0u8.to_be(),
-        //bConfigurationValue: 0u8.to_be(),
-        bConfigurationValue: 1u8.to_be(),
+        bConfigurationValue: 0u8.to_be(),
         bNumConfigurations: 1u8.to_be(),
         bNumInterfaces: 1u8.to_be(),
     };

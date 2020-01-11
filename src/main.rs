@@ -33,8 +33,8 @@ fn main() {
             Ok(x) => x,
             Err(err) => panic!("Failed to open token: {}", err)
         };
-        let listener = TcpListener::bind("192.168.178.22:3240").unwrap();
-        println!("USBIP Testserver");
+        let listener = TcpListener::bind("127.0.0.1:3240").unwrap();
+        println!("Softfido server running.");
         for s in listener.incoming() {
             println!("New connection {:?}\n", s);
             handle_stream(&mut s.unwrap(), &token).unwrap();
