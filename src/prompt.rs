@@ -3,19 +3,7 @@ use pinentry_rs;
 use std::sync::mpsc::{Receiver};
 use secstr;
 
-#[allow(dead_code)]
-fn ttyname(fd: libc::c_int) -> Result<String, std::io::Error> {
-    let mut buffer = vec![0x0u8; 80];
-    let ptr = buffer.as_mut_ptr() as *mut i8;
-    match unsafe { libc::ttyname_r(fd, ptr, buffer.len()) } {
-        0 => {
-            let end = buffer.iter().position(|&c| c == 0).unwrap();
-            Ok(std::str::from_utf8(&buffer[..end]).unwrap().to_string())
-        }
-        err => Err(std::io::Error::from_raw_os_error(err)),
-    }
-}
-
+// FIXME: report report this as bug pinentry_rs maintainer.
 fn escape_string(s: &str) -> String {
     let mut r = String::with_capacity(s.len());
     for c in s.chars() {

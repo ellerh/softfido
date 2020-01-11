@@ -15,7 +15,6 @@ rand = "0.7.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_cbor = "0.10.2"
 pkcs11 = "0.4.1"
-libc = "0.2"  # TODO: still needed?
 pinentry-rs = "0.1.0"
 secstr = "0.3.2"
 x509 = "0.1.2"
