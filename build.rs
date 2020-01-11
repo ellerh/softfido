@@ -4,7 +4,7 @@ fn main() {
     let bindings = bindgen::Builder::default()
         // The input header we would like to generate
         // bindings for.
-        .header("src/x.h")
+        .header("src/bindings.h")
         .whitelist_type("op_common")
         .whitelist_type("op_devlist_reply")
         .whitelist_type("op_devlist_reply_extra")
