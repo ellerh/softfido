@@ -19,6 +19,8 @@ use std::io::{Error, Read, Write};
 use std::mem::size_of;
 use std::cmp::min;
 use bindings::*;
+use packed_struct::prelude::*;
+
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -32,7 +34,6 @@ const LANG_ID_EN_US: u16 = 0x0409;
 // const URB_NO_INTERRUPT        = 0x00000080;
 // const URB_FREE_BUFFER         = 0x00000100;
 pub const URB_DIR_MASK:u32            = 0x00000200;
-
 
 #[derive(PackedStruct, Clone, Copy, Debug)]
 #[packed_struct(endian = "lsb")]

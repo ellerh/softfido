@@ -2,7 +2,6 @@ extern crate packed_struct;
 extern crate serde_cbor;
 extern crate pkcs11;
 
-#[macro_use] extern crate packed_struct_codegen;
 #[macro_use] mod macros;
 #[macro_use] extern crate lazy_static;
 

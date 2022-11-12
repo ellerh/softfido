@@ -8,9 +8,7 @@ exclude = ["python"]
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-packed_struct = "0.3"
-packed_struct_codegen = "0.3"
-# bitflags = "1.1.0"
+packed_struct = "0.10"
 serde = { version = "1.0", features = ["derive"] }
 serde_cbor = "0.10.2"
 pkcs11 = "0.4.1"

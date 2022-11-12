@@ -8,6 +8,7 @@ use std::collections::VecDeque;
 use packed_struct::PackedStruct;
 use std::time::Duration;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use packed_struct::prelude::*;
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 type Q = VecDeque<Vec<u8>>;
@@ -46,7 +47,7 @@ const CTAPHID_CBOR: u8 = 0x10;
 const CTAPHID_MSG: u8 = 0x03;
 const CTAPHID_ERROR: u8 = 0x3F;
 const CTAPHID_KEEPALIVE: u8 = 0x3B;
-const CTAPHID_VENDOR_FIRST: u8 = (0x40);
+const CTAPHID_VENDOR_FIRST: u8 = 0x40;
 const HACK_CHECK_STATUS: u8 = CTAPHID_VENDOR_FIRST + 10;
 
 //const CAPABILITY_WINK: u8 = 0x01;
@@ -116,12 +117,15 @@ struct Bytes (Vec<u8>);
 #[derive(Debug, Deserialize)]
 struct MakeCredentialArgs {
     _marker: Option<()>,
+    #[allow(dead_code)]
     client_data_hash: Bytes,
     rp: RelyingParty,
     user: User,
     pub_key_algs: Vec<PublicKeyCredentialParameters>,
     #[serde(default)]
+    #[allow(dead_code)]
     exclude_credentials: Vec<PublicKeyCredentialDescriptor>,
+    #[allow(dead_code)]
     extensions: Option<()>,
     #[serde(default)]
     options: MakeCredentialArgsOptions
@@ -131,6 +135,7 @@ struct MakeCredentialArgs {
 struct RelyingParty {
     id: String,
     name: Option<String>,
+    #[allow(dead_code)]
     icon: Option<String>
 }
 
@@ -161,6 +166,7 @@ struct PublicKeyCredentialDescriptor {
 #[derive(Debug, Deserialize, Default)]
 struct MakeCredentialArgsOptions {
     rk: bool,
+    #[allow(dead_code)]
     uv: bool,
 }
 
@@ -189,8 +195,10 @@ struct GetAssertionArgs {
     client_data_hash: Bytes,
     #[serde(default)]
     allow_list: Vec<PublicKeyCredentialDescriptor>,
+    #[allow(dead_code)]
     extensions: Option<()>,
     #[serde(default = "options_default")]
+    #[allow(dead_code)]
     options: GetAssertionOptions,
 }
 
@@ -199,6 +207,7 @@ struct GetAssertionOptions {
     #[serde(default = "up_default")]
     up: bool,
     #[serde(default)]
+    #[allow(dead_code)]
     uv: bool,
 }
 fn options_default () -> GetAssertionOptions {
@@ -368,7 +377,7 @@ impl<'a> Parser<'a> {
             device_build_version: 0,
             capabilities: CAPABILITY_CBOR & !CAPABILITY_NMSG,
         };
-        self.send_queue.push_back(Vec::from(&response.pack()[..]));
+        self.send_queue.push_back(Vec::from(&response.pack()?[..]));
         Ok(())
     }
 
@@ -751,7 +760,7 @@ Allow?",
                 },
                 _ => None
             }
-        };
+        }
         match (&data[..4], payload (&data[4..])) {
             ([0, 3, 0, 0], Some(( 0, _, 0))) => self.u2f_version(q),
             ([0, 1, p1,0], Some((64, d, 0))) if [0, 3].contains(&p1) =>
