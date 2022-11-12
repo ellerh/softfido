@@ -1,3 +1,6 @@
+// Copyright: Helmut Eller
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 use crate::usbip;
 use usbip::bindings::{usbip_header,
                       USBIP_DIR_IN, USBIP_DIR_OUT,

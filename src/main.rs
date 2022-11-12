@@ -1,3 +1,6 @@
+// Copyright: Helmut Eller
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 extern crate packed_struct;
 extern crate serde_cbor;
 extern crate pkcs11;

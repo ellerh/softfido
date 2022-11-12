@@ -1,3 +1,5 @@
+// Copyright: Helmut Eller
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::prompt;
 use crate::crypto;

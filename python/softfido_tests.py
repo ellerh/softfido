@@ -1,4 +1,5 @@
-
+#  Copyright: Helmut Eller
+#  SPDX-License-Identifier: GPL-3.0-or-later
 
 #import fido2
 ## .hid import CtapHidDevice

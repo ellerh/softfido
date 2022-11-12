@@ -1,3 +1,5 @@
+// Copyright: Helmut Eller
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 pub mod bindings {
     #![allow(non_upper_case_globals)]

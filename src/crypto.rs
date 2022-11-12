@@ -1,3 +1,5 @@
+// Copyright: Helmut Eller
+// SPDX-License-Identifier: GPL-3.0-or-later
 
 use pkcs11::{Ctx, errors::Error};
 use pkcs11::types::*;

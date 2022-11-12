@@ -1,3 +1,6 @@
+// Copyright: Helmut Eller
+// SPDX-License-Identifier: GPL-3.0-or-later
+
 #![allow(dead_code)]
 
 fn short_item(typ: u8, tag: u8, data: u32) -> Vec<u8> {
