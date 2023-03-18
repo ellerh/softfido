@@ -1,100 +1,104 @@
 // Copyright: Helmut Eller
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use pkcs11::{Ctx, errors::Error};
-use pkcs11::types::*;
+use crate::prompt;
 use chrono::{DateTime, Utc};
 use cookie_factory;
-use crate::prompt;
+use cryptoki::context::Pkcs11;
+use cryptoki::error::Result as CResult;
+use cryptoki::mechanism::Mechanism as M;
+use cryptoki::object::{
+    Attribute as A, AttributeType, KeyType, ObjectClass, ObjectHandle,
+};
+use cryptoki::session::Session;
+use cryptoki::slot::Slot;
+use secrecy;
+use secrecy::zeroize::Zeroize;
+use secrecy::SecretString;
+use std::convert::TryInto;
+use std::error::Error;
+type R<T> = Result<T, Box<dyn Error>>;
 
-pub struct KeyStore<'a> {
-    ctx: &'a Ctx,
-    session: CK_SESSION_HANDLE,
+pub struct KeyStore {
+    s: Session,
 }
 
-impl<'a> Drop for KeyStore<'a> {
-    fn drop(&mut self) {
-        self.ctx.close_session(self.session).unwrap()
-    }
-}
-
-fn match_label(pattern: &str, label: &[u8; 32]) -> bool {
-    match std::str::from_utf8(label) {
-        Ok(label) => label.trim() == pattern.trim(),
-        Err(_) => false
-    }
-}
-
-fn find_token(ctx: &Ctx, label: &str) -> Result<Vec<CK_SLOT_ID>, Error> {
-    let mut result = vec!();
-    for slot_id in ctx.get_slot_list(true)? {
-        let info = ctx.get_token_info(slot_id)?;
-        if match_label(label, &info.label) {
-            result.push(slot_id);
+fn find_token(pkcs11: &Pkcs11, label: &str) -> CResult<Vec<Slot>> {
+    let mut result = vec![];
+    for slot in pkcs11.get_slots_with_token()? {
+        let info = pkcs11.get_token_info(slot)?;
+        if label == info.label() {
+            result.push(slot);
         }
     }
     Ok(result)
 }
 
-fn login(ctx: &Ctx, slot_id: CK_SLOT_ID,
-         pin_file: &Option<String>) -> Result<CK_SESSION_HANDLE, Error> {
-    let info = ctx.get_token_info(slot_id)?;
-    let s = ctx.open_session(slot_id, CKF_SERIAL_SESSION | CKF_RW_SESSION,
-                             None, None)?;
-    let need_pin = info.flags & CKF_PROTECTED_AUTHENTICATION_PATH == 0;
+fn login(p: &Pkcs11, slot: Slot, pin_file: Option<&str>) -> R<Session> {
+    let info = p.get_token_info(slot)?;
+    let s = p.open_rw_session(slot)?;
+    let need_pin = !info.protected_authentication_path();
     let pin = match (need_pin, pin_file) {
-        (false, _) => secstr::SecStr::new(vec!()),
-        (true, None) => {
-            let prompt = format!(
-                "Please insert the User PIN for the token with\nlabel: {}",
-                String::from_utf8_lossy(&info.label));
-            prompt::read_pin(&prompt).expect("Can't read PIN")
-        },
-        (true, Some(filename)) => read_pin_file(filename)
-            .expect(&format!("Can't read PIN from file {}", filename)),
+        (false, _) => SecretString::from("".to_string()),
+        (true, None) => prompt::read_pin(&format!(
+            "Please insert the User PIN for the token with\nlabel: {}",
+            info.label()
+        ))?,
+        (true, Some(filename)) => read_pin_file(&filename)?,
     };
-    ctx.login(s, CKU_USER, match need_pin {
-        true => Some(std::str::from_utf8(pin.unsecure()).unwrap()),
-        false => None
-    })?;
+    s.login(cryptoki::session::UserType::User, need_pin.then(|| &pin))
+        .map_err(|e| format!("login failed: {}", &e))?;
     Ok(s)
 }
 
-fn read_pin_file(file_name: &str) -> std::io::Result<secstr::SecStr> {
-    fn erase(v: &mut Vec<u8>) { v.iter_mut().map(|x| *x = 0).count(); }
+fn read_pin_file(file: &str) -> std::io::Result<SecretString> {
     let mut output = std::process::Command::new("gpg")
-        .arg("--decrypt").arg(file_name)
+        .arg("--decrypt")
+        .arg(file)
         .output()?;
-    if output.status.success() {
-        let stdout = &mut output.stdout;
-        let v = stdout[..stdout.len()-1].to_vec();
-        erase(stdout);
-        Ok(secstr::SecStr::new(v))
+    use std::io::{Error as E, ErrorKind};
+    let r = if output.status.success() {
+        let b = &output.stdout;
+        std::str::from_utf8(&b[..b.len() - 1])
+            .map(|s| SecretString::from(String::from(s)))
+            .map_err(|e| E::new(ErrorKind::InvalidData, e))
     } else {
-        erase(&mut output.stdout);
-        panic!("gpg failed: {}",
-               String::from_utf8_lossy(&output.stderr))
-    }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let msg = format!(
+            "read_pin_file {} failed: gpg failed: {}",
+            file, stderr
+        );
+        Err(E::new(ErrorKind::Other, msg))
+    };
+    output.stdout.zeroize();
+    r
 }
 
-
 pub mod globals {
-    use std::sync::{Mutex, Arc};
+    use cryptoki::context::{CInitializeArgs, Pkcs11};
     use std::path::Path;
-    use pkcs11::{Ctx};
+    use std::sync::{Arc, Mutex};
     lazy_static! {
         static ref LOCK: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
     }
 
     pub type R<T> = Result<T, Box<dyn std::error::Error>>;
 
-    pub fn with_ctx<T> (module: &str, f: &dyn Fn (R<&Ctx>) -> R<T>) -> R<T> {
+    pub fn with_ctx<T>(
+        module: &str,
+        f: &dyn Fn(R<&Pkcs11>) -> R<T>,
+    ) -> R<T> {
         let mut lock = LOCK.lock().unwrap();
         let path = Path::new(module);
         assert!(*lock == 0);
         *lock = *lock + 1;
-        let r = match Ctx::new_and_initialize(path) {
-            Ok(ctx) => f(Ok(&ctx)),
+        let r = match Pkcs11::new(path) {
+            Ok(mut pkcs11) => {
+                match pkcs11.initialize(CInitializeArgs::OsThreads) {
+                    Ok(()) => f(Ok(&pkcs11)),
+                    Err(e) => f(Err(From::from(e))),
+                }
+            }
             Err(e) => f(Err(Box::new(e))),
         };
         *lock = *lock - 1;
@@ -103,49 +107,54 @@ pub mod globals {
     }
 }
 
-pub fn open_token<'a> (ctx: &'a Ctx, label: &str,
-                       pin_file: &Option<String>)
-                       -> Result<KeyStore<'a>, Error> {
-    let slot_ids = find_token(&ctx, label)?;
-    let slot_id = match slot_ids.len() {
-        1 => slot_ids[0],
-        l => return Err(Error::Module(match l {
-            0 => "No token with matching label found",
-            _ => "Multiple tokens with matching label found",
-        })),
+pub fn open_token(
+    p: &Pkcs11,
+    label: &str,
+    pin_file: Option<&str>,
+) -> R<KeyStore> {
+    let slot = match find_token(p, label)?[..] {
+        [slot] => slot,
+        [] => Err("No token with matching label found")?,
+        _ => Err("Multiple tokens with matching label found")?,
     };
-    let s = login(&ctx, slot_id, pin_file)?;
-    let token = KeyStore{ ctx: ctx, session: s};
+    let s = login(&p, slot, pin_file.map(|x| x.as_ref()))?;
+    let token = KeyStore { s: s };
     match token.find_secret_key()? {
         None => {
             log!("Generating secret key...");
             token.create_secret_key()?
-        },
+        }
         _ => log!("Found secret key."),
     };
     match token.find_token_counter()? {
         None => {
             log!("Generating token counter...");
             token.create_token_counter(0)?
-        },
-        _ => log!("Found token counter. ({})",
-                  token.increment_token_counter()?),
+        }
+        _ => log!(
+            "Found token counter. ({})",
+            token.increment_token_counter()?
+        ),
     };
     Ok(token)
 }
 
 // OID: 1.2.840.10045.3.1.7
-const OID_SECP256R1: &[u64] = &[1,2,840,10045,3,1,7];
-const OID_EC_PUBLIC_KEY: &[u64] = &[1,2,840,10045,2,1];
-const OID_ECDSA_WITH_SHA256: &[u64] = &[1,2,840,10045,4,3,2];
+const OID_SECP256R1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
+const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
+const OID_ECDSA_WITH_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
 
-fn curve_oid (name: &str) -> &'static [u8] {
+fn curve_oid(name: &str) -> &'static [u8] {
     // DER encoding of OID: 1.2.840.10045.3.1.7
-    const OID:&[u8] =
+    const OID: &[u8] =
         &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
     match name {
-        "secp256r1" => /*"1.2.840.10045.3.1.7".as_bytes() */ OID,
-        _ => panic!("Uknown curve: {}", name)
+        "secp256r1" =>
+        /*"1.2.840.10045.3.1.7".as_bytes() */
+        {
+            OID
+        }
+        _ => panic!("Uknown curve: {}", name),
     }
 }
 
@@ -158,7 +167,7 @@ fn curve_oid (name: &str) -> &'static [u8] {
 
 // See Section Octet-String-to-Elliptic-Curve-Point Conversion
 // in http://www.secg.org/sec1-v2.pdf.
-fn ec_point_x_y (point: &[u8]) -> (Vec<u8>, Vec<u8>) {
+fn ec_point_x_y(point: &[u8]) -> (Vec<u8>, Vec<u8>) {
     assert!(point[0] == 0x04, "not a DER octed string tag");
     assert!(point[1] == 65, "invalid length");
     assert!(point[2] == 0x04, "point not in uncompressed format");
@@ -167,32 +176,35 @@ fn ec_point_x_y (point: &[u8]) -> (Vec<u8>, Vec<u8>) {
     assert!((len - 3) % 2 == 0);
     let l = (len - 3) / 2;
     assert!(l == 32);
-    let (x, y) = (point[3..3+l].to_vec(), point[3+l..].to_vec());
+    let (x, y) = (point[3..3 + l].to_vec(), point[3 + l..].to_vec());
     (x, y)
 }
 
-// Set all elements to 0
-fn zero(data: &mut [u8]) {
-    for i in 0..data.len() {
-        data[i] = 0;
-    }
-}
+// // Set all elements to 0
+// fn zero(data: &mut [u8]) {
+//     for i in 0..data.len() {
+//         data[i] = 0;
+//     }
+// }
 
-fn with_vec<T, F>(data: &[u8], f: F) -> T
-    where F: FnOnce(&Vec<u8>) -> T {
-    let mut tmp = data.to_vec();
-    let result = f(&tmp);
-    zero(&mut tmp);
-    result
-}
+// fn with_vec<T, F>(data: &[u8], f: F) -> T
+// where
+//     F: FnOnce(&Vec<u8>) -> T,
+// {
+//     let mut tmp = data.to_vec();
+//     let result = f(&tmp);
+//     zero(&mut tmp);
+//     result
+// }
 
-fn der_encode_signature (points: &[u8]) -> Vec<u8> {
+fn der_encode_signature(points: &[u8]) -> Vec<u8> {
     assert!(points.len() == 64);
     let (r, s) = (&points[..32], &points[32..]);
-    fn encode_integer (mut int: &[u8], out: &mut Vec<u8>) {
+    fn encode_integer(mut int: &[u8], out: &mut Vec<u8>) {
         out.push(0x02);
-        int = &int[int.iter().position(|&i| i != 0).unwrap() ..];
-        if int[0] & 0x80 != 0 {   // would be interpreted as sign flag
+        int = &int[int.iter().position(|&i| i != 0).unwrap()..];
+        if int[0] & 0x80 != 0 {
+            // would be interpreted as sign flag
             out.push(int.len() as u8 + 1); // so insert an extra zero
             out.push(0);
         } else {
@@ -207,247 +219,232 @@ fn der_encode_signature (points: &[u8]) -> Vec<u8> {
     out
 }
 
-// shorthand for mechanism without paramaters.
-fn mechanism(mechanism: CK_MECHANISM_TYPE) -> CK_MECHANISM {
-    CK_MECHANISM {
-        mechanism: mechanism,
-        pParameter: std::ptr::null_mut(),
-        ulParameterLen: 0,
-    }
-}
-
-const A: fn(CK_ATTRIBUTE_TYPE) -> CK_ATTRIBUTE = CK_ATTRIBUTE::new;
-
 const SECRET_KEY_LABEL: &str = "softfido-secret-key";
 const TOKEN_COUNTER_LABEL: &str = "softfido-token-counter";
 
-impl<'a> KeyStore<'a> {
-
-    fn find_secret_key(&self) -> Result<Option<CK_OBJECT_HANDLE>, Error> {
-        let (ctx, s) = (&self.ctx, self.session);
-        ctx.find_objects_init(
-            s,
-            &vec![A(CKA_LABEL).with_string(&SECRET_KEY_LABEL.to_string()),
-                  A(CKA_CLASS).with_ck_ulong(&CKO_SECRET_KEY)],)?;
-        let r = ctx.find_objects(s, 2)?;
-        ctx.find_objects_final(s)?;
+impl<'a> KeyStore {
+    fn find_secret_key(&self) -> R<Option<ObjectHandle>> {
+        let attrs = &vec![
+            A::Label(SECRET_KEY_LABEL.into()),
+            A::Class(ObjectClass::SECRET_KEY),
+        ];
+        let r = self
+            .s
+            .find_objects(attrs)
+            .or_else(|e| Err(format!("find_objects failed: {}", &e)))?;
         match r.len() {
             0 => Ok(None),
             1 => Ok(Some(r[0])),
-            _ => Err(Error::Module("Found multiple secret keys"))
+            _ => Err("Found multiple secret keys")?,
         }
     }
 
-    fn find_token_counter(&self) -> Result<Option<CK_OBJECT_HANDLE>, Error> {
-        let (ctx, s) = (&self.ctx, self.session);
-        ctx.find_objects_init(
-            s,
-            &vec![A(CKA_LABEL).with_string(&TOKEN_COUNTER_LABEL.to_string()),
-                  A(CKA_CLASS).with_ck_ulong(&CKO_DATA)],)?;
-        let r = ctx.find_objects(s, 2)?;
-        ctx.find_objects_final(s)?;
-        match r.len() {
-            0 => Ok(None),
-            1 => Ok(Some(r[0])),
-            _ => Err(Error::Module("Found multiple token counters"))
+    fn find_token_counter(&self) -> R<Option<ObjectHandle>> {
+        let attrs = vec![
+            A::Label(TOKEN_COUNTER_LABEL.into()),
+            A::Class(ObjectClass::DATA),
+        ];
+        match self.s.find_objects(&attrs)?[..] {
+            [] => Ok(None),
+            [c] => Ok(Some(c)),
+            _ => Err("Found multiple token counters")?,
         }
     }
 
-    fn create_secret_key(&self) -> Result<(), Error> {
-        let ctx = self.ctx;
-        ctx.generate_key(
-            self.session, &mechanism(CKM_AES_KEY_GEN),
-            &vec![A(CKA_CLASS).with_ck_ulong(&CKO_SECRET_KEY),
-                  A(CKA_KEY_TYPE).with_ck_ulong(&CKK_AES),
-                  A(CKA_VALUE_LEN).with_ck_ulong(&32),
-                  A(CKA_LABEL).with_string(&SECRET_KEY_LABEL.to_string()),
-                  A(CKA_TOKEN).with_bool(&CK_TRUE),
-                  A(CKA_SENSITIVE).with_bool(&CK_TRUE),
-                  A(CKA_EXTRACTABLE).with_bool(&CK_FALSE),
-                  A(CKA_WRAP).with_bool(&CK_TRUE),
-                  A(CKA_UNWRAP).with_bool(&CK_TRUE),
-                  A(CKA_ENCRYPT).with_bool(&CK_TRUE),
-                  A(CKA_DECRYPT).with_bool(&CK_TRUE),
-            ],)?;
+    fn create_secret_key(&self) -> CResult<()> {
+        self.s.generate_key(
+            &M::AesKeyGen,
+            &vec![
+                A::Class(ObjectClass::SECRET_KEY),
+                A::KeyType(KeyType::AES),
+                A::ValueLen(32.into()),
+                A::Label(SECRET_KEY_LABEL.into()),
+                A::Token(true),
+                A::Sensitive(true),
+                A::Extractable(false),
+                A::Wrap(true),
+                A::Unwrap(true),
+                A::Encrypt(true),
+                A::Decrypt(true),
+            ],
+        )?;
         assert!(self.find_secret_key().unwrap().is_some());
         Ok(())
     }
-    
-    fn create_token_counter(&self, value:u32) -> Result<(), Error> {
-        self.ctx.create_object(
-            self.session, 
-            &vec![A(CKA_CLASS).with_ck_ulong(&CKO_DATA),
-                  A(CKA_TOKEN).with_bool(&CK_TRUE),
-                  A(CKA_LABEL).with_string(&TOKEN_COUNTER_LABEL.to_string()),
-                  A(CKA_DESTROYABLE).with_bool(&CK_TRUE),
-                  A(CKA_VALUE).with_bytes(&value.to_be_bytes()),
-            ],)?;
+
+    fn create_token_counter(&self, value: u32) -> CResult<()> {
+        self.s.create_object(&vec![
+            A::Class(ObjectClass::DATA),
+            A::Token(true),
+            A::Label(TOKEN_COUNTER_LABEL.into()),
+            A::Destroyable(true),
+            A::Value(value.to_le_bytes()[..].to_vec()),
+        ])?;
         assert!(self.find_token_counter().unwrap().is_some());
         Ok(())
     }
 
-    pub fn increment_token_counter(&self) -> Result<u32, Error> {
-        let (ctx, s) = (&self.ctx, self.session);
+    pub fn increment_token_counter(&self) -> CResult<u32> {
         let counter = self.find_token_counter().unwrap().unwrap();
-        #[allow(unused_mut)]
-        let mut bytes = [0u8;4];
-        let mut template = vec![A(CKA_VALUE).with_bytes(&bytes)];
-        let v = match ctx.get_attribute_value(s, counter, &mut template) {
-            Ok((CKR_OK, _)) => u32::from_be_bytes(bytes),
-            Ok((err,_)) => return Err(Error::Pkcs11(err)),
-            Err(err) => return Err(err),
+        let template = vec![AttributeType::Value];
+        let attrs = self.s.get_attributes(counter, &template)?;
+        let bytes = match &attrs[..] {
+            [A::Value(bytes)] => bytes,
+            _ => {
+                panic!("bug in increment_token_counter: {:?}", &attrs)
+            }
         };
-        ctx.destroy_object(s, counter)?;
-        self.create_token_counter(v+1)?; 
+        let v = u32::from_le_bytes(TryInto::try_into(&bytes[..])?);
+        self.s.destroy_object(counter)?;
+        self.create_token_counter(v + 1)?;
         Ok(v)
-    }
-
-    fn get_bytes_attribute(&self, key: CK_OBJECT_HANDLE,
-                           attr: CK_ATTRIBUTE_TYPE)
-                           -> Result<Vec<u8>, Error> {
-        let (ctx, s) = (&self.ctx, self.session);
-        let mut template = vec![CK_ATTRIBUTE::new(attr)];
-        match ctx.get_attribute_value(s, key, &mut template) {
-            Ok((CKR_OK, _)) => (),
-            Ok((CKR_BUFFER_TOO_SMALL, _)) => (),
-            Ok((err,_)) => return Err(Error::Pkcs11(err)),
-            Err(err) => return Err(err),
-        }
-        let mut bytes = vec!(0; template[0].ulValueLen);
-        template[0].set_bytes(&mut bytes);
-        match ctx.get_attribute_value(s, key, &mut template) {
-            Ok((CKR_OK, _)) => Ok(bytes),
-            Ok((err,_)) => Err(Error::Pkcs11(err)),
-            Err(err) => Err(err),
-        }
     }
 
     // Return the private and public keys.
     // The wrapped private key is also the credentialId.
     // The public key is an (x, y) point of an elliptic curve.
-    pub fn generate_key_pair(&self) -> Result<(Vec<u8>, (Vec<u8>, Vec<u8>)),
-                                              Error> {
-        let (ctx, s) = (&self.ctx, self.session);
-        let (pub_key, priv_key) = ctx.generate_key_pair(
-            s, &mechanism(CKM_EC_KEY_PAIR_GEN),
-            &vec![A(CKA_KEY_TYPE).with_ck_ulong(&CKK_EC),
-                  A(CKA_TOKEN).with_bool(&CK_FALSE),
-                  A(CKA_EC_PARAMS).with_bytes(curve_oid("secp256r1")),
-            ],
-            &vec![A(CKA_TOKEN).with_bool(&CK_FALSE),
-                  A(CKA_EXTRACTABLE).with_bool(&CK_TRUE),
-            ])?;
+    pub fn generate_key_pair(&self) -> R<(Vec<u8>, (Vec<u8>, Vec<u8>))> {
+        let pub_attrs = vec![
+            A::KeyType(KeyType::EC),
+            A::Token(false),
+            A::EcParams(curve_oid("secp256r1").into()),
+        ];
+        let priv_attrs = &vec![A::Token(false), A::Extractable(true)];
+        let (pub_key, priv_key) = self
+            .s
+            .generate_key_pair(&M::EccKeyPairGen, &pub_attrs, &priv_attrs)
+            .map_err(|e| format!("generate_key_pair failed: {}", &e))?;
         let wrapping_key = self.find_secret_key()?.unwrap();
-        let wrapped_key = ctx.wrap_key(s, &mechanism(CKM_AES_KEY_WRAP_PAD),
-                                       wrapping_key, priv_key)?;
-        Ok((wrapped_key,
-            ec_point_x_y(&self.get_bytes_attribute(pub_key, CKA_EC_POINT)?)))
+        let wrapped_key =
+            self.s.wrap_key(&M::AesKeyWrapPad, wrapping_key, priv_key)?;
+        let attrs =
+            self.s.get_attributes(pub_key, &[AttributeType::EcPoint])?;
+        let pub_x_y = match &attrs[..] {
+            [A::EcPoint(point)] => ec_point_x_y(&point),
+            _ => panic!("bug in generate_key_pair: {:?}", &attrs),
+        };
+        Ok((wrapped_key, pub_x_y))
     }
 
     pub fn is_valid_id(&self, key: &[u8]) -> bool {
         let wrapping_key = self.find_secret_key().unwrap().unwrap();
-        self.ctx.unwrap_key(
-            self.session, &mechanism(CKM_AES_KEY_WRAP_PAD),
-            wrapping_key, &key.to_vec(),
-            &vec![A(CKA_CLASS).with_ck_ulong(&CKO_PRIVATE_KEY),
-                  A(CKA_KEY_TYPE).with_ck_ulong(&CKK_EC),
-                  A(CKA_TOKEN).with_bool(&CK_FALSE),
-            ]).is_ok()
+        let template = vec![
+            A::Class(ObjectClass::PRIVATE_KEY),
+            A::KeyType(KeyType::EC),
+            A::Token(false),
+        ];
+        self.s
+            .unwrap_key(&M::AesKeyWrapPad, wrapping_key, &key, &template)
+            .is_ok()
     }
 
-    pub fn sha256_hash(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
-        let (ctx, s) = (&self.ctx, self.session);
-        ctx.digest_init(s, &mechanism(CKM_SHA256))?;
-        with_vec(data, |data| ctx.digest(s, data))
+    pub fn sha256_hash(&self, data: &[u8]) -> CResult<Vec<u8>> {
+        self.s.digest(&M::Sha256, &data)
     }
-    
-    pub fn sign(&self, key: &[u8], data: &[u8]) -> Result<Vec<u8>, Error> {
-        let (ctx, s) = (&self.ctx, self.session);
-        let hash = self.sha256_hash(&data)?;
-        //assert!(hash == sha256_hash(data));
+
+    pub fn sign(&self, key: &[u8], data: &[u8]) -> R<Vec<u8>> {
         let wrapping_key = self.find_secret_key()?.unwrap();
-        let private_key = ctx.unwrap_key(
-            s, &mechanism(CKM_AES_KEY_WRAP_PAD),
-            wrapping_key, &key.to_vec(),
-            &vec![A(CKA_CLASS).with_ck_ulong(&CKO_PRIVATE_KEY),
-                  A(CKA_KEY_TYPE).with_ck_ulong(&CKK_EC),
-                  A(CKA_TOKEN).with_bool(&CK_FALSE),
-            ])?;
-        ctx.sign_init(s, &mechanism(CKM_ECDSA), private_key)?;
-        let signature = ctx.sign(s, &hash)?;
+        let attrs = vec![
+            A::Class(ObjectClass::PRIVATE_KEY),
+            A::KeyType(KeyType::EC),
+            A::Token(false),
+        ];
+        let private_key = self
+            .s
+            .unwrap_key(&M::AesKeyWrapPad, wrapping_key, key, &attrs)
+            .map_err(|e| format!("unwrap_key failed: {}", &e))?;
+        let hash = self.sha256_hash(&data)?;
+        let signature = self.s.sign(&M::Ecdsa, private_key, &hash[..])?;
         Ok(der_encode_signature(&signature))
     }
 
-    pub fn encrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
+    pub fn encrypt(&self, data: &[u8]) -> R<Vec<u8>> {
         println!("encrypt: data.len={}", data.len());
         let len = data.len();
         assert!(len <= 255);
-        let d = [&[len as u8][..], data, &vec![0u8;31-len%32]].concat();
-        let (ctx, s) = (&self.ctx, self.session);
+        let d =
+            [&[len as u8][..], data, &vec![0u8; 31 - len % 32]].concat();
         let key = self.find_secret_key()?.unwrap();
-        ctx.encrypt_init(s, &mechanism(CKM_AES_ECB), key)?;
-        ctx.encrypt(s, &d.to_vec())
+        Ok(self.s.encrypt(&M::AesEcb, key, &d)?)
     }
 
-    pub fn decrypt(&self, data: &[u8]) -> Result<Vec<u8>, Error> {
+    pub fn decrypt(&self, data: &[u8]) -> R<Vec<u8>> {
         println!("decrypt");
-        if data.len()%32 != 0 || data.len() == 0 {
-            return Err(Error::Module("data has invalid length"));
+        if data.len() % 32 != 0 || data.len() == 0 {
+            Err("data has invalid length")?
         }
-        let (ctx, s) = (&self.ctx, self.session);
         let key = self.find_secret_key()?.unwrap();
-        ctx.decrypt_init(s, &mechanism(CKM_AES_ECB), key)?;
-        let d = ctx.decrypt(s, &data.to_vec())?;
+        let d = self.s.decrypt(&M::AesEcb, key, data)?;
         let len = d[0];
-        if 1+len as usize > d.len() {
-            return Err(Error::Module("invalid decrypted data"));
+        if 1 + len as usize > d.len() {
+            Err("invalid decrypted data")?
         }
-        Ok(d[1..1+len as usize].to_vec())
+        Ok(d[1..1 + len as usize].to_vec())
     }
 
     // FIXME: use clock from token
-    pub fn create_certificate(&self, wrapped_priv_key: &[u8], pub_key: &[u8],
-                              issuer: &str, subject: &str,
-                              not_before: DateTime<Utc>, 
-                              not_after: Option<DateTime<Utc>>) ->
-        Result<Vec<u8>, Error> {
-            let sig_algo = EcdsaWithSha256 {};
-            let (tbs_cert, _pos) = cookie_factory::gen(
-                x509::write::tbs_certificate(
-                    &[0],
-                    &sig_algo,
-                    issuer,
-                    not_before, not_after,
-                    subject,
-                    &EcSubjectPublicKeyInfo{ public_key: pub_key }
-                ),
-                Vec::<u8>::new()).unwrap();
-            let sig = self.sign(wrapped_priv_key, &tbs_cert)?;
-            let (cert, _pos) = cookie_factory::gen(
-                x509::write::certificate(&tbs_cert, &sig_algo, &sig),
-                Vec::new()).unwrap();
-            Ok(cert)
-        }
+    pub fn create_certificate(
+        &self,
+        wrapped_priv_key: &[u8],
+        pub_key: &[u8],
+        issuer: &str,
+        subject: &str,
+        not_before: DateTime<Utc>,
+        not_after: Option<DateTime<Utc>>,
+    ) -> R<Vec<u8>> {
+        let sig_algo = EcdsaWithSha256 {};
+        let (tbs_cert, _pos) = cookie_factory::gen(
+            x509::write::tbs_certificate(
+                &[0],
+                &sig_algo,
+                issuer,
+                not_before,
+                not_after,
+                subject,
+                &EcSubjectPublicKeyInfo {
+                    public_key: pub_key,
+                },
+            ),
+            Vec::<u8>::new(),
+        )
+        .unwrap();
+        let sig = self.sign(wrapped_priv_key, &tbs_cert)?;
+        let (cert, _pos) = cookie_factory::gen(
+            x509::write::certificate(&tbs_cert, &sig_algo, &sig),
+            Vec::new(),
+        )
+        .unwrap();
+        Ok(cert)
+    }
 }
 
-#[derive(Clone)] struct EcPublicKey {}
-#[derive(Clone)] struct EcdsaWithSha256 {}
+#[derive(Clone)]
+struct EcPublicKey {}
+#[derive(Clone)]
+struct EcdsaWithSha256 {}
 
 impl x509::AlgorithmIdentifier for EcdsaWithSha256 {
     type AlgorithmOid = &'static [u64];
-    fn algorithm(&self) -> &'static [u64] { OID_ECDSA_WITH_SHA256 }
-    fn parameters<W: std::io::Write>(&self, w: cookie_factory::WriteContext<W>)
-                                     ->  cookie_factory::GenResult<W> {
+    fn algorithm(&self) -> &'static [u64] {
+        OID_ECDSA_WITH_SHA256
+    }
+    fn parameters<W: std::io::Write>(
+        &self,
+        w: cookie_factory::WriteContext<W>,
+    ) -> cookie_factory::GenResult<W> {
         Ok(w)
     }
 }
 
-
 impl x509::AlgorithmIdentifier for EcPublicKey {
     type AlgorithmOid = &'static [u64];
-    fn algorithm(&self) -> &'static [u64] { OID_EC_PUBLIC_KEY }
-    fn parameters<W: std::io::Write>(&self, w: cookie_factory::WriteContext<W>)
-                                     ->  cookie_factory::GenResult<W> {
+    fn algorithm(&self) -> &'static [u64] {
+        OID_EC_PUBLIC_KEY
+    }
+    fn parameters<W: std::io::Write>(
+        &self,
+        w: cookie_factory::WriteContext<W>,
+    ) -> cookie_factory::GenResult<W> {
         x509::der::write::der_oid(OID_SECP256R1)(w)
     }
 }
@@ -459,40 +456,45 @@ struct EcSubjectPublicKeyInfo<'a> {
 impl<'a> x509::SubjectPublicKeyInfo for EcSubjectPublicKeyInfo<'a> {
     type AlgorithmId = EcPublicKey;
     type SubjectPublicKey = &'a [u8];
-    fn algorithm_id (&self) -> Self::AlgorithmId { EcPublicKey{} }
-    fn public_key (&self) -> &'a [u8] { self.public_key }
+    fn algorithm_id(&self) -> Self::AlgorithmId {
+        EcPublicKey {}
+    }
+    fn public_key(&self) -> &'a [u8] {
+        self.public_key
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::globals::{with_ctx, R};
-    
-    fn with_token<T> (f: &dyn Fn (&super::KeyStore) -> R<T>) -> R<T> {
+
+    fn with_token<T>(f: &dyn Fn(&super::KeyStore) -> R<T>) -> R<T> {
         let lib = "/usr/lib/softhsm/libsofthsm2.so";
         let home = std::env::var("HOME").unwrap();
-        let pinfile = Some(format!("{}/.password-store/softhsm2/user-pin.gpg",
-                                   home));
+        let pinfile =
+            format!("{}/.password-store/softhsm2/user-pin.gpg", home);
         let label = "softfido";
         with_ctx(lib, &|ctx| -> R<T> {
             let ctx = ctx.unwrap();
-            let token = super::open_token(&ctx, label, &pinfile)?;
+            let p = pinfile.as_ref();
+            let token = super::open_token(&ctx, label.as_ref(), Some(p))?;
             f(&token)
         })
     }
-    
+
     #[test]
-    fn open_token () {
-        let _ = with_token(&|_| {Ok(())});
-        let _ = with_token(&|_| {Ok(())});
-        let _ = with_token(&|_| {Ok(())});
+    fn open_token() {
+        let _ = with_token(&|_| Ok(()));
+        let _ = with_token(&|_| Ok(()));
+        let _ = with_token(&|_| Ok(()));
     }
 
     #[test]
     // this is run in another thread
-    fn open_token2 () {
-        let _ = with_token(&|_| {Ok(())});
-        let _ = with_token(&|_| {Ok(())});
-        let _ = with_token(&|_| {Ok(())});
+    fn open_token2() {
+        let _ = with_token(&|_| Ok(()));
+        let _ = with_token(&|_| Ok(()));
+        let _ = with_token(&|_| Ok(()));
     }
 
     #[test]
@@ -500,7 +502,8 @@ mod tests {
         with_token(&|token| {
             token.generate_key_pair()?;
             Ok(())
-        }).unwrap()
+        })
+        .unwrap()
     }
 
     #[test]
@@ -510,14 +513,19 @@ mod tests {
             let pub_key = [&[4u8][..], &x[..], &y].concat();
             let not_before = chrono::Utc::now();
             let not_after = not_before + chrono::Duration::days(30);
-            let cert = token.create_certificate(&wpriv_key, &pub_key,
-                                                "Fakecompany", "Fakecompany",
-                                                not_before, Some(not_after))?;
+            let cert = token.create_certificate(
+                &wpriv_key,
+                &pub_key,
+                "Fakecompany",
+                "Fakecompany",
+                not_before,
+                Some(not_after),
+            )?;
             let mut file = std::fs::File::create("/tmp/cert.der")?;
             use std::io::Write;
             file.write_all(&cert[..])?;
             Ok(())
-        }).unwrap()
+        })
+        .unwrap()
     }
-
 }

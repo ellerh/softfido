@@ -1,22 +1,24 @@
 // Copyright: Helmut Eller
 // SPDX-License-Identifier: GPL-3.0-or-later
 
+extern crate cryptoki;
 extern crate packed_struct;
 extern crate serde_cbor;
-extern crate pkcs11;
 
-#[macro_use] mod macros;
-#[macro_use] extern crate lazy_static;
+#[macro_use]
+mod macros;
+#[macro_use]
+extern crate lazy_static;
 
-mod usbip;
-mod hid;
+mod crypto;
 mod ctaphid;
 mod eventloop;
-mod crypto;
+mod hid;
 mod prompt;
+mod usbip;
 
+use std::error::Error;
 use std::net::{TcpListener, TcpStream};
-use std::error::{Error};
 use usbip::bindings as c;
 
 struct Args {
@@ -28,26 +30,30 @@ struct Args {
 
 fn main() {
     let args = parse_args();
-    crypto::globals::with_ctx(&args.pkcs11_module,&|ctx| {
+    crypto::globals::with_ctx(&args.pkcs11_module, &|ctx| {
         let ctx = match ctx {
             Ok(ctx) => ctx,
-            Err(e) => panic!("Failed to load pckcs11_module: {} {:?}",
-                             e, e)
+            Err(e) => {
+                panic!("Failed to load pckcs11_module: {} {:?}", e, e)
+            }
         };
         let token = match crypto::open_token(
             &ctx,
-            &args.token_label, &args.pin_file) {
+            args.token_label.as_ref(),
+            args.pin_file.as_ref().map(|x| x.as_ref()),
+        ) {
             Ok(x) => x,
-            Err(err) => panic!("Failed to open token: {}", err)
+            Err(err) => panic!("Failed to open token: {}", err),
         };
         let listener = TcpListener::bind("127.0.0.1:3240").unwrap();
         println!("Softfido server running.");
         for s in listener.incoming() {
             println!("New connection {:?}\n", s);
             handle_stream(&mut s.unwrap(), &token).unwrap();
-        };
+        }
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
 }
 
 fn default_args() -> Args {
@@ -64,18 +70,27 @@ fn print_usage() {
     println!("USAGE: {} [OPTIONS]", prog);
     println!("OPTIONS:");
     println!("  --help                   Print help information");
-    println!("  --token-label <LABEL>    Use LABEL to find the crypto token \
-              [{}]", args.token_label);
-    println!("  --pkcs11-module <LIB>    Load LIB to access the PCKC11 store \
-              [{}]", args.pkcs11_module);
-    println!("  --pin-file <FILE>        Read gpg encryped User-PIN from FILE \
-              [{:?}]", args.pin_file);
+    println!(
+        "  --token-label <LABEL>    Use LABEL to find the crypto token \
+              [{}]",
+        args.token_label
+    );
+    println!(
+        "  --pkcs11-module <LIB>    Load LIB to access the PCKC11 store \
+              [{}]",
+        args.pkcs11_module
+    );
+    println!(
+        "  --pin-file <FILE>        Read gpg encryped User-PIN from FILE \
+              [{:?}]",
+        args.pin_file
+    );
 }
 
 fn parse_args() -> Args {
     let mut args = std::env::args().skip(1);
     let mut r = default_args();
-    fn req (arg: Option<String>, name: &str) -> String {
+    fn req(arg: Option<String>, name: &str) -> String {
         match arg {
             Some(s) => s,
             None => panic!("Option {} requires argument", name),
@@ -87,33 +102,35 @@ fn parse_args() -> Args {
             Some(s) => match s.as_str() {
                 "--pkcs11-module" => {
                     r.pkcs11_module = req(args.next(), "--pkcs11-module");
-                },
+                }
                 "--token-label" => {
                     r.token_label = req(args.next(), "--token-label");
-                },
+                }
                 "--pin-file" => {
                     r.pin_file = Some(req(args.next(), "--pin-file"));
-                },
+                }
                 "--help" => {
                     print_usage();
                     std::process::exit(0)
                 }
                 x => panic!("Invalid argument: {}", x),
-            }
+            },
         }
     }
 }
 
-fn handle_stream (stream: &mut TcpStream, token: &crypto::KeyStore)
-                  -> Result<(), Box<dyn Error>> {
+fn handle_stream(
+    stream: &mut TcpStream,
+    token: &crypto::KeyStore,
+) -> Result<(), Box<dyn Error>> {
     stream.set_nodelay(true)?;
     let (version, code, status) = usbip::read_op_common(stream)?;
     match (version, code as u32, status) {
         (usbip::USBIP_VERSION, c::OP_REQ_DEVLIST, 0) => {
             println!("OP_REQ_DEVLIST");
-            usbip::write_op_rep_devlist (stream)?;
+            usbip::write_op_rep_devlist(stream)?;
             stream.shutdown(std::net::Shutdown::Both)?
-        },
+        }
         (usbip::USBIP_VERSION, c::OP_REQ_IMPORT, 0) => {
             println!("OP_REQ_IMPORT");
             let busid = usbip::read_busid(stream)?;
@@ -121,20 +138,23 @@ fn handle_stream (stream: &mut TcpStream, token: &crypto::KeyStore)
             if busid != "1-1" {
                 panic!("Invalid busid: {}", busid)
             }
-            usbip::write_op_rep_import (stream)?;
+            usbip::write_op_rep_import(stream)?;
             println!("import request busid {} complete", busid);
             handle_commands(stream, token)?
-        },
-        _ =>
-            panic!("Unsupported packet: \
+        }
+        _ => panic!(
+            "Unsupported packet: \
                     version: 0x{:x} code: 0x{:x} status: 0x{:x}",
-                   version, code, status),
+            version, code, status
+        ),
     }
     Ok(())
 }
 
-fn handle_commands (stream: &mut TcpStream, token: &crypto::KeyStore)
-                    -> Result<(), Box<dyn Error>> {
+fn handle_commands(
+    stream: &mut TcpStream,
+    token: &crypto::KeyStore,
+) -> Result<(), Box<dyn Error>> {
     let mut dev = usbip::Device::new(token);
     let mut el = eventloop::EventLoop::new(&mut dev);
     usbip::Device::init_callbacks(&mut el);
