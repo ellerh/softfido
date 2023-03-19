@@ -3,24 +3,68 @@
 
 use crate::prompt;
 use chrono::{DateTime, Utc};
-use cookie_factory;
-use cryptoki::context::Pkcs11;
-use cryptoki::error::Result as CResult;
-use cryptoki::mechanism::Mechanism as M;
-use cryptoki::object::{
-    Attribute as A, AttributeType, KeyType, ObjectClass, ObjectHandle,
+use cryptoki::{
+    context::Pkcs11,
+    error::Result as CResult,
+    mechanism::Mechanism as M,
+    object::{
+        Attribute as A, AttributeType, KeyType, ObjectClass, ObjectHandle,
+    },
+    session::Session,
+    slot::Slot,
 };
-use cryptoki::session::Session;
-use cryptoki::slot::Slot;
-use secrecy;
-use secrecy::zeroize::Zeroize;
-use secrecy::SecretString;
+use secrecy::{zeroize::Zeroize, SecretString};
 use std::convert::TryInto;
 use std::error::Error;
+use std::sync::{Mutex, MutexGuard};
+
 type R<T> = Result<T, Box<dyn Error>>;
 
-pub struct KeyStore {
+pub struct KeyStore<'a> {
     s: Session,
+    #[allow(dead_code)]
+    // guard.drop unlocks the global mutex
+    guard: MutexGuard<'a, ()>,
+}
+
+// Realistically, at most one session can be open at any time.
+static MUTEX: Mutex<()> = Mutex::new(());
+
+pub fn open_token<'a>(
+    module: &str,
+    label: &str,
+    pin_file: Option<&str>,
+) -> R<KeyStore<'a>> {
+    let guard = MUTEX.lock()?;
+    let path = std::path::Path::new(module);
+    let mut pkcs11 = Pkcs11::new(path)?;
+    pkcs11.initialize(cryptoki::context::CInitializeArgs::OsThreads)?;
+    let slot = match find_token(&pkcs11, label)?[..] {
+        [slot] => slot,
+        [] => Err("No token with matching label found")?,
+        _ => Err("Multiple tokens with matching label found")?,
+    };
+    // Note: open_rw_session clones pkcs11.
+    let s = login(&pkcs11, slot, pin_file.map(|x| x.as_ref()))?;
+    let token = KeyStore::<'a> { guard: guard, s: s };
+    match token.find_secret_key()? {
+        None => {
+            log!("Generating secret key...");
+            token.create_secret_key()?
+        }
+        _ => log!("Found secret key."),
+    };
+    match token.find_token_counter()? {
+        None => {
+            log!("Generating token counter...");
+            token.create_token_counter(0)?
+        }
+        _ => log!(
+            "Found token counter. ({})",
+            token.increment_token_counter()?
+        ),
+    };
+    Ok(token)
 }
 
 fn find_token(pkcs11: &Pkcs11, label: &str) -> CResult<Vec<Slot>> {
@@ -74,71 +118,6 @@ fn read_pin_file(file: &str) -> std::io::Result<SecretString> {
     r
 }
 
-pub mod globals {
-    use cryptoki::context::{CInitializeArgs, Pkcs11};
-    use std::path::Path;
-    use std::sync::{Arc, Mutex};
-    lazy_static! {
-        static ref LOCK: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
-    }
-
-    pub type R<T> = Result<T, Box<dyn std::error::Error>>;
-
-    pub fn with_ctx<T>(
-        module: &str,
-        f: &dyn Fn(R<&Pkcs11>) -> R<T>,
-    ) -> R<T> {
-        let mut lock = LOCK.lock().unwrap();
-        let path = Path::new(module);
-        assert!(*lock == 0);
-        *lock = *lock + 1;
-        let r = match Pkcs11::new(path) {
-            Ok(mut pkcs11) => {
-                match pkcs11.initialize(CInitializeArgs::OsThreads) {
-                    Ok(()) => f(Ok(&pkcs11)),
-                    Err(e) => f(Err(From::from(e))),
-                }
-            }
-            Err(e) => f(Err(Box::new(e))),
-        };
-        *lock = *lock - 1;
-        assert!(*lock == 0);
-        r
-    }
-}
-
-pub fn open_token(
-    p: &Pkcs11,
-    label: &str,
-    pin_file: Option<&str>,
-) -> R<KeyStore> {
-    let slot = match find_token(p, label)?[..] {
-        [slot] => slot,
-        [] => Err("No token with matching label found")?,
-        _ => Err("Multiple tokens with matching label found")?,
-    };
-    let s = login(&p, slot, pin_file.map(|x| x.as_ref()))?;
-    let token = KeyStore { s: s };
-    match token.find_secret_key()? {
-        None => {
-            log!("Generating secret key...");
-            token.create_secret_key()?
-        }
-        _ => log!("Found secret key."),
-    };
-    match token.find_token_counter()? {
-        None => {
-            log!("Generating token counter...");
-            token.create_token_counter(0)?
-        }
-        _ => log!(
-            "Found token counter. ({})",
-            token.increment_token_counter()?
-        ),
-    };
-    Ok(token)
-}
-
 // OID: 1.2.840.10045.3.1.7
 const OID_SECP256R1: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
 const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
@@ -180,23 +159,6 @@ fn ec_point_x_y(point: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (x, y)
 }
 
-// // Set all elements to 0
-// fn zero(data: &mut [u8]) {
-//     for i in 0..data.len() {
-//         data[i] = 0;
-//     }
-// }
-
-// fn with_vec<T, F>(data: &[u8], f: F) -> T
-// where
-//     F: FnOnce(&Vec<u8>) -> T,
-// {
-//     let mut tmp = data.to_vec();
-//     let result = f(&tmp);
-//     zero(&mut tmp);
-//     result
-// }
-
 fn der_encode_signature(points: &[u8]) -> Vec<u8> {
     assert!(points.len() == 64);
     let (r, s) = (&points[..32], &points[32..]);
@@ -222,7 +184,7 @@ fn der_encode_signature(points: &[u8]) -> Vec<u8> {
 const SECRET_KEY_LABEL: &str = "softfido-secret-key";
 const TOKEN_COUNTER_LABEL: &str = "softfido-token-counter";
 
-impl<'a> KeyStore {
+impl<'a> KeyStore<'a> {
     fn find_secret_key(&self) -> R<Option<ObjectHandle>> {
         let attrs = &vec![
             A::Label(SECRET_KEY_LABEL.into()),
@@ -406,14 +368,12 @@ impl<'a> KeyStore {
                 },
             ),
             Vec::<u8>::new(),
-        )
-        .unwrap();
+        )?;
         let sig = self.sign(wrapped_priv_key, &tbs_cert)?;
         let (cert, _pos) = cookie_factory::gen(
             x509::write::certificate(&tbs_cert, &sig_algo, &sig),
             Vec::new(),
-        )
-        .unwrap();
+        )?;
         Ok(cert)
     }
 }
@@ -466,66 +426,59 @@ impl<'a> x509::SubjectPublicKeyInfo for EcSubjectPublicKeyInfo<'a> {
 
 #[cfg(test)]
 mod tests {
-    use super::globals::{with_ctx, R};
+    use super::R;
 
-    fn with_token<T>(f: &dyn Fn(&super::KeyStore) -> R<T>) -> R<T> {
+    fn get_token<'a>() -> R<super::KeyStore<'a>> {
         let lib = "/usr/lib/softhsm/libsofthsm2.so";
-        let home = std::env::var("HOME").unwrap();
+        let home = std::env::var("HOME")?;
         let pinfile =
             format!("{}/.password-store/softhsm2/user-pin.gpg", home);
         let label = "softfido";
-        with_ctx(lib, &|ctx| -> R<T> {
-            let ctx = ctx.unwrap();
-            let p = pinfile.as_ref();
-            let token = super::open_token(&ctx, label.as_ref(), Some(p))?;
-            f(&token)
-        })
+        super::open_token(lib, label, Some(pinfile.as_ref()))
     }
 
     #[test]
-    fn open_token() {
-        let _ = with_token(&|_| Ok(()));
-        let _ = with_token(&|_| Ok(()));
-        let _ = with_token(&|_| Ok(()));
+    fn open_token() -> R<()> {
+        get_token()?;
+        get_token()?;
+        get_token()?;
+        Ok(())
     }
 
     #[test]
     // this is run in another thread
-    fn open_token2() {
-        let _ = with_token(&|_| Ok(()));
-        let _ = with_token(&|_| Ok(()));
-        let _ = with_token(&|_| Ok(()));
+    fn open_token2() -> R<()> {
+        get_token()?;
+        get_token()?;
+        get_token()?;
+        Ok(())
     }
 
     #[test]
-    fn get_keys() {
-        with_token(&|token| {
-            token.generate_key_pair()?;
-            Ok(())
-        })
-        .unwrap()
+    fn get_keys() -> R<()> {
+        let token = get_token()?;
+        token.generate_key_pair()?;
+        Ok(())
     }
 
     #[test]
-    fn print_cert() {
-        with_token(&|token| {
-            let (wpriv_key, (x, y)) = token.generate_key_pair()?;
-            let pub_key = [&[4u8][..], &x[..], &y].concat();
-            let not_before = chrono::Utc::now();
-            let not_after = not_before + chrono::Duration::days(30);
-            let cert = token.create_certificate(
-                &wpriv_key,
-                &pub_key,
-                "Fakecompany",
-                "Fakecompany",
-                not_before,
-                Some(not_after),
-            )?;
-            let mut file = std::fs::File::create("/tmp/cert.der")?;
-            use std::io::Write;
-            file.write_all(&cert[..])?;
-            Ok(())
-        })
-        .unwrap()
+    fn print_cert() -> R<()> {
+        let token = get_token()?;
+        let (wpriv_key, (x, y)) = token.generate_key_pair()?;
+        let pub_key = [&[4u8][..], &x[..], &y].concat();
+        let not_before = chrono::Utc::now();
+        let not_after = not_before + chrono::Duration::days(30);
+        let cert = token.create_certificate(
+            &wpriv_key,
+            &pub_key,
+            "Fakecompany",
+            "Fakecompany",
+            not_before,
+            Some(not_after),
+        )?;
+        let mut file = std::fs::File::create("/tmp/cert.der")?;
+        use std::io::Write;
+        file.write_all(&cert[..])?;
+        Ok(())
     }
 }

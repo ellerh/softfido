@@ -21,7 +21,7 @@ secrecy = "0.8.0"
 x509 = "0.1.2"
 chrono = "0.4"
 cookie-factory = "0.3.0"
-lazy_static = "1.4.0"
+#lazy_static = "1.4.0"
 
 [build-dependencies]
 bindgen = "0.64.0"

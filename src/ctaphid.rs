@@ -20,13 +20,13 @@ type Q = VecDeque<Vec<u8>>;
 pub struct Parser<'a> {
     pub send_queue: Q,
     pub recv_queue: Q,
-    token: &'a crypto::KeyStore,
+    token: &'a crypto::KeyStore<'a>,
     channels: Vec<Channel<'a>>,
 }
 
 struct Channel<'a> {
     cid: u32,
-    token: &'a crypto::KeyStore,
+    token: &'a crypto::KeyStore<'a>,
     state: State,
 }
 
@@ -224,7 +224,10 @@ struct GetAssertionOptions {
     uv: bool,
 }
 fn options_default() -> GetAssertionOptions {
-    GetAssertionOptions { up: true, uv: false }
+    GetAssertionOptions {
+        up: true,
+        uv: false,
+    }
 }
 fn up_default() -> bool {
     options_default().up
@@ -486,7 +489,12 @@ impl<'a> Channel<'a> {
     }
 
     fn cont_state(&mut self, pkt: &[u8], q: &mut Q) -> R<()> {
-        if let State::Cont { seqnum, buffer, bcnt, cmd } = &mut self.state
+        if let State::Cont {
+            seqnum,
+            buffer,
+            bcnt,
+            cmd,
+        } = &mut self.state
         {
             assert!(pkt.len() > 5);
             let cid = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
@@ -616,7 +624,10 @@ Allow? ",
             &args.user.display_name
         );
         let x = prompt::yes_or_no_p(&prompt);
-        self.state = State::MakeCredential { args: args, consent: x };
+        self.state = State::MakeCredential {
+            args: args,
+            consent: x,
+        };
         self.make_credential_2(q)
     }
 
@@ -751,7 +762,10 @@ Allow?",
             &args.rp_id
         );
         let x = prompt::yes_or_no_p(&prompt);
-        self.state = State::GetAssertion { args: args, consent: x };
+        self.state = State::GetAssertion {
+            args: args,
+            consent: x,
+        };
         self.get_assertion_2(q)
     }
 

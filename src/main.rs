@@ -7,8 +7,6 @@ extern crate serde_cbor;
 
 #[macro_use]
 mod macros;
-#[macro_use]
-extern crate lazy_static;
 
 mod crypto;
 mod ctaphid;
@@ -30,30 +28,19 @@ struct Args {
 
 fn main() {
     let args = parse_args();
-    crypto::globals::with_ctx(&args.pkcs11_module, &|ctx| {
-        let ctx = match ctx {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                panic!("Failed to load pckcs11_module: {} {:?}", e, e)
-            }
-        };
-        let token = match crypto::open_token(
-            &ctx,
-            args.token_label.as_ref(),
-            args.pin_file.as_ref().map(|x| x.as_ref()),
-        ) {
-            Ok(x) => x,
-            Err(err) => panic!("Failed to open token: {}", err),
-        };
-        let listener = TcpListener::bind("127.0.0.1:3240").unwrap();
-        println!("Softfido server running.");
-        for s in listener.incoming() {
-            println!("New connection {:?}\n", s);
-            handle_stream(&mut s.unwrap(), &token).unwrap();
-        }
-        Ok(())
-    })
+    let token = crypto::open_token(
+        &args.pkcs11_module,
+        args.token_label.as_ref(),
+        args.pin_file.as_ref().map(|x| x.as_ref()),
+    )
+    .map_err(|e| panic!("Failed to open token: {}", e))
     .unwrap();
+    let listener = TcpListener::bind("127.0.0.1:3240").unwrap();
+    println!("Softfido server running.");
+    for s in listener.incoming() {
+        println!("New connection {:?}\n", s);
+        handle_stream(&mut s.unwrap(), &token).unwrap();
+    }
 }
 
 fn default_args() -> Args {
