@@ -40,7 +40,8 @@ key_params = [{'type': 'public-key', 'alg': alg} for alg in algos]
 
 def test_make_credential():
     def on_keepalive (status):
-        print("on_keepalive: ", status)
+        #print("on_keepalive: ", status)
+        pass
     return open_ctap().make_credential(b'hash', rp, user, key_params,
                                        on_keepalive=on_keepalive)
 

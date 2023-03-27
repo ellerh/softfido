@@ -10,10 +10,13 @@ pub mod bindings {
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
-use crate::crypto;
+use crate::crypto::KeyStore;
 use crate::ctaphid;
+use crate::error::R;
 use crate::eventloop;
 use crate::hid;
+use crate::prompt;
+use crate::prompt::Prompt;
 use bindings::*;
 use packed_struct::prelude::*;
 use packed_struct::PackedStruct;
@@ -22,8 +25,8 @@ use std::cmp::min;
 use std::convert::TryFrom;
 use std::io::{Error, Read, Write};
 use std::mem::size_of;
-
-type R<T> = Result<T, Box<dyn std::error::Error>>;
+use std::net::{TcpListener, TcpStream};
+use std::os::raw::c_char;
 
 pub const USBIP_VERSION: u16 = 0x0111u16;
 const LANG_ID_EN_US: u16 = 0x0409;
@@ -160,7 +163,10 @@ pub struct Device<'a> {
 }
 
 impl<'a> Device<'a> {
-    pub fn new(token: &'a crypto::KeyStore) -> Self {
+    pub fn new(
+        token: &'a KeyStore,
+        prompt: &'a dyn prompt::Prompt,
+    ) -> Self {
         let hid_report_descriptor: Vec<u8> = {
             use hid::*;
             [
@@ -181,9 +187,8 @@ impl<'a> Device<'a> {
                 output(DATA | VARIABLE | ABSOLUTE),
                 end_collection(),
             ]
-            .iter()
+            .into_iter()
             .flatten()
-            .map(|&u8| u8)
             .collect()
         };
 
@@ -292,7 +297,7 @@ impl<'a> Device<'a> {
                 "Default Config",
                 "The Interface",
             ],
-            parser: ctaphid::Parser::new(token),
+            parser: ctaphid::Parser::new(token, prompt),
         }
     }
 
@@ -577,7 +582,7 @@ impl<'a> Device<'a> {
     }
 }
 
-fn read_struct<T>(stream: &mut dyn Read) -> Result<T, Error> {
+fn read_struct<T: Copy>(stream: &mut dyn Read) -> Result<T, Error> {
     unsafe {
         let s = std::mem::MaybeUninit::<T>::uninit();
         stream.read_exact(any_as_u8_slice(&s))?;
@@ -589,15 +594,8 @@ fn write_struct<T>(stream: &mut dyn Write, s: &T) -> Result<(), Error> {
     stream.write_all(unsafe { any_as_u8_slice(s) })
 }
 
-pub fn read_op_common(
-    stream: &mut dyn Read,
-) -> Result<(u16, u16, u32), Error> {
-    let header = read_struct::<op_common>(stream)?;
-    Ok((
-        u16::from_be(header.version),
-        u16::from_be(header.code),
-        u32::from_be(header.status),
-    ))
+pub fn read_op_common(r: &mut dyn Read) -> Result<(u16, u32, u32), Error> {
+    Ok(read_struct::<op_common>(r)?.parse())
 }
 
 fn op_common(code: u32) -> op_common {
@@ -609,31 +607,23 @@ fn op_common(code: u32) -> op_common {
 }
 
 fn usb_device() -> usbip_usb_device {
-    let mut dev = usbip_usb_device {
-        path: [0; 256],
-        busid: [0; 32],
+    use std::array::from_fn;
+    usbip_usb_device {
+        path: from_fn(|i| *b"/frob/bar".get(i).unwrap_or(&0) as c_char),
+        busid: from_fn(|i| *b"1-1".get(i).unwrap_or(&0) as c_char),
         busnum: 33u32.to_be(),
         devnum: 22u32.to_be(),
         speed: 2u32.to_be(),
-        idVendor: 0u16.to_be(),
-        idProduct: 0u16.to_be(),
-        bcdDevice: 0u16.to_be(),
-        bDeviceClass: 0u8.to_be(),
-        bDeviceSubClass: 0u8.to_be(),
-        bDeviceProtocol: 0u8.to_be(),
-        bConfigurationValue: 0u8.to_be(),
-        bNumConfigurations: 1u8.to_be(),
-        bNumInterfaces: 1u8.to_be(),
-    };
-    b"/frob/bar"
-        .iter()
-        .enumerate()
-        .for_each(|(i, &v)| dev.path[i] = v as i8);
-    b"1-1"
-        .iter()
-        .enumerate()
-        .for_each(|(i, &v)| dev.busid[i] = v as i8);
-    dev
+        idVendor: 0,
+        idProduct: 0,
+        bcdDevice: 0,
+        bDeviceClass: 0,
+        bDeviceSubClass: 0,
+        bDeviceProtocol: 0,
+        bConfigurationValue: 0,
+        bNumConfigurations: 1,
+        bNumInterfaces: 1,
+    }
 }
 
 fn usb_interface() -> usbip_usb_interface {
@@ -743,22 +733,39 @@ pub fn write_unlink_reply(
     )
 }
 
-pub fn read_busid(stream: &mut dyn Read) -> Result<String, Error> {
-    let req: op_import_request = read_struct(stream)?;
+impl op_common {
+    fn parse(&self) -> (u16, u32, u32) {
+        (
+            u16::from_be(self.version),
+            u16::from_be(self.code) as u32,
+            u32::from_be(self.status),
+        )
+    }
+}
+
+fn parse_cstring(bytes: &[c_char]) -> R<String> {
     Ok(String::from_utf8(
-        req.busid
+        bytes
             .iter()
             .take_while(|&&x| x != 0)
             .map(|&x| x as u8)
             .collect(),
-    )
-    .unwrap())
+    )?)
 }
 
-pub fn read_cmd_header(
-    stream: &mut dyn Read,
-) -> Result<usbip_header, Error> {
-    read_struct(stream)
+impl op_import_request {
+    fn parse(&self) -> String {
+        parse_cstring(&self.busid)
+            .expect("busid should be a valid UTF-8 sequence")
+    }
+}
+
+pub fn read_busid(stream: &mut dyn Read) -> Result<String, Error> {
+    Ok(read_struct::<op_import_request>(stream)?.parse())
+}
+
+pub fn read_cmd_header(r: &mut dyn Read) -> Result<usbip_header, Error> {
+    read_struct(r)
 }
 
 pub unsafe fn any_as_u8_slice<T>(p: &T) -> &mut [u8] {
@@ -778,4 +785,120 @@ where
     let min = min(buf.len(), r.len());
     buf[..min].copy_from_slice(&r[..min]);
     v
+}
+
+pub fn start_server(
+    listener: &TcpListener,
+    token: &KeyStore,
+    p: &dyn Prompt,
+) {
+    for s in listener.incoming() {
+        println!("New connection {:?}\n", s);
+        handle_stream(&mut s.unwrap(), token, p).unwrap();
+    }
+}
+
+fn handle_stream(
+    s: &mut TcpStream,
+    t: &KeyStore,
+    p: &dyn Prompt,
+) -> R<()> {
+    s.set_nodelay(true)?;
+    match read_op_common(s)? {
+        (USBIP_VERSION, OP_REQ_DEVLIST, 0) => {
+            println!("OP_REQ_DEVLIST");
+            write_op_rep_devlist(s)?;
+            s.shutdown(std::net::Shutdown::Both)?
+        }
+        (USBIP_VERSION, OP_REQ_IMPORT, 0) => {
+            println!("OP_REQ_IMPORT");
+            let busid = read_busid(s)?;
+            println!("busid: {}", busid);
+            if busid != "1-1" {
+                panic!("Invalid busid: {}", busid)
+            }
+            write_op_rep_import(s)?;
+            println!("import request busid {} complete", busid);
+            handle_commands(s, t, p)?
+        }
+        (version, code, status) => panic!(
+            "Unsupported packet: \
+	     version: 0x{:x} code: 0x{:x} status: 0x{:x}",
+            version, code, status
+        ),
+    }
+    Ok(())
+}
+
+fn handle_commands(
+    s: &mut TcpStream,
+    t: &KeyStore,
+    p: &dyn Prompt,
+) -> R<()> {
+    let mut dev = Device::new(t, p);
+    let mut el = eventloop::EventLoop::new(&mut dev);
+    Device::init_callbacks(&mut el);
+    el.handle_commands(s)
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use crate::crypto::tests::get_token;
+
+    fn as_ptr<T>(bytes: &[u8]) -> *const T {
+        assert_eq!(bytes.len(), size_of::<T>());
+        let ptr = bytes.as_ptr().cast::<T>();
+        assert!(ptr.align_offset(std::mem::align_of::<T>()) == 0);
+        ptr
+    }
+
+    fn view_as<T: Copy>(bytes: &[u8]) -> &T {
+        unsafe { as_ptr::<T>(bytes).as_ref().unwrap() }
+    }
+
+    pub const IMPORT_REQUEST: &[u8] =
+        include_bytes!("../poke/usbip-import-request.dat");
+
+    #[test]
+    fn parse_import_request() -> R<()> {
+        let data = IMPORT_REQUEST;
+        const HEADER_SIZE: usize = size_of::<op_common>();
+        const REQEUST_SIZE: usize = size_of::<op_import_request>();
+        assert_eq!(data.len(), HEADER_SIZE + REQEUST_SIZE);
+        assert_eq!(
+            view_as::<op_common>(&data[..HEADER_SIZE]).parse(),
+            (USBIP_VERSION, OP_REQ_IMPORT, 0)
+        );
+        let req = view_as::<op_import_request>(&data[HEADER_SIZE..]);
+        assert_eq!(req.parse(), "1-1");
+        Ok(())
+    }
+
+    fn read_usb_device(r: &mut dyn Read) -> R<usbip_usb_device> {
+        Ok(read_struct::<usbip_usb_device>(r)?)
+    }
+
+    fn test_import_request<T: Read + Write>(mut s: T) {
+        s.write_all(IMPORT_REQUEST).unwrap();
+        assert_eq!(
+            read_op_common(&mut s).unwrap(),
+            (USBIP_VERSION, OP_REP_IMPORT, 0)
+        );
+        let dev = read_usb_device(&mut s).unwrap();
+        assert_eq!(parse_cstring(&dev.path).unwrap(), "/frob/bar");
+        assert_eq!(parse_cstring(&dev.busid).unwrap(), "1-1");
+    }
+
+    #[test]
+    fn test_server() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let s =
+            TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let _handle = std::thread::spawn(move || {
+            let token = get_token().unwrap();
+            super::start_server(&listener, &token, &prompt::Pinentry {})
+        });
+        test_import_request(s);
+    }
 }

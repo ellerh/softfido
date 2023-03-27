@@ -1,0 +1,33 @@
+
+type TagName= struct { string name; uint tag; };
+type TagNames = TagName[];
+
+fun tag = (string name, uint tag) TagName:
+{
+  return TagName{name=name, tag=tag};
+};
+
+fun printTag = (uint tag, TagNames ts) void:
+{
+  for (t in ts where t.tag == tag) {
+    printf ("%s",t.name);
+    return;
+  };
+  assert(0, format("invalid tag: %v (%v)", tag, ts));
+};
+
+fun validTag = (uint tag, TagNames ts) uint:
+{
+  for (t in ts where t.tag == tag) {
+    return 1;
+  };
+  return 0;
+};
+
+fun getTag = (string name, TagNames ts) uint:
+{
+  for (t in ts where t.name == name) {
+    return t.tag;
+  };
+  assert(0, format("invalid tag name: %v (%v)", name, ts));
+};

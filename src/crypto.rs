@@ -1,7 +1,7 @@
 // Copyright: Helmut Eller
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::prompt;
+use crate::error::R;
 use chrono::{DateTime, Utc};
 use cryptoki::{
     context::Pkcs11,
@@ -15,10 +15,7 @@ use cryptoki::{
 };
 use secrecy::{zeroize::Zeroize, SecretString};
 use std::convert::TryInto;
-use std::error::Error;
 use std::sync::{Mutex, MutexGuard};
-
-type R<T> = Result<T, Box<dyn Error>>;
 
 pub struct KeyStore<'a> {
     s: Session,
@@ -30,10 +27,16 @@ pub struct KeyStore<'a> {
 // Realistically, at most one session can be open at any time.
 static MUTEX: Mutex<()> = Mutex::new(());
 
+pub enum Pin<'a> {
+    Ask(&'a dyn Fn(&str) -> R<SecretString>),
+    String(SecretString),
+    File(String),
+}
+
 pub fn open_token<'a>(
     module: &str,
     label: &str,
-    pin_file: Option<&str>,
+    pin: Pin,
 ) -> R<KeyStore<'a>> {
     let guard = MUTEX.lock()?;
     let path = std::path::Path::new(module);
@@ -45,8 +48,8 @@ pub fn open_token<'a>(
         _ => Err("Multiple tokens with matching label found")?,
     };
     // Note: open_rw_session clones pkcs11.
-    let s = login(&pkcs11, slot, pin_file.map(|x| x.as_ref()))?;
-    let token = KeyStore::<'a> { guard: guard, s: s };
+    let s = login(&pkcs11, slot, pin)?;
+    let token = KeyStore::<'a> { guard, s };
     match token.find_secret_key()? {
         None => {
             log!("Generating secret key...");
@@ -78,17 +81,18 @@ fn find_token(pkcs11: &Pkcs11, label: &str) -> CResult<Vec<Slot>> {
     Ok(result)
 }
 
-fn login(p: &Pkcs11, slot: Slot, pin_file: Option<&str>) -> R<Session> {
+fn login(p: &Pkcs11, slot: Slot, pin: Pin) -> R<Session> {
     let info = p.get_token_info(slot)?;
     let s = p.open_rw_session(slot)?;
     let need_pin = !info.protected_authentication_path();
-    let pin = match (need_pin, pin_file) {
+    let pin = match (need_pin, pin) {
         (false, _) => SecretString::from("".to_string()),
-        (true, None) => prompt::read_pin(&format!(
+        (true, Pin::Ask(f)) => f(&format!(
             "Please insert the User PIN for the token with\nlabel: {}",
             info.label()
         ))?,
-        (true, Some(filename)) => read_pin_file(&filename)?,
+        (true, Pin::File(filename)) => read_pin_file(&filename)?,
+        (true, Pin::String(s)) => s,
     };
     s.login(cryptoki::session::UserType::User, need_pin.then(|| &pin))
         .map_err(|e| format!("login failed: {}", &e))?;
@@ -425,16 +429,14 @@ impl<'a> x509::SubjectPublicKeyInfo for EcSubjectPublicKeyInfo<'a> {
 }
 
 #[cfg(test)]
-mod tests {
+pub mod tests {
     use super::R;
 
-    fn get_token<'a>() -> R<super::KeyStore<'a>> {
+    pub fn get_token<'a>() -> R<super::KeyStore<'a>> {
         let lib = "/usr/lib/softhsm/libsofthsm2.so";
-        let home = std::env::var("HOME")?;
-        let pinfile =
-            format!("{}/.password-store/softhsm2/user-pin.gpg", home);
-        let label = "softfido";
-        super::open_token(lib, label, Some(pinfile.as_ref()))
+        let label = "test-softfido";
+        let pin = String::from("fedcba");
+        super::open_token(lib, label, super::Pin::String(pin.into()))
     }
 
     #[test]

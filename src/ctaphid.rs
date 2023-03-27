@@ -21,11 +21,13 @@ pub struct Parser<'a> {
     pub send_queue: Q,
     pub recv_queue: Q,
     token: &'a crypto::KeyStore<'a>,
+    prompt: &'a dyn prompt::Prompt,
     channels: Vec<Channel<'a>>,
 }
 
 struct Channel<'a> {
     cid: u32,
+    prompt: &'a dyn prompt::Prompt,
     token: &'a crypto::KeyStore<'a>,
     state: State,
 }
@@ -309,12 +311,16 @@ impl<'de> serde::de::Visitor<'de> for BytesVisitor {
 }
 
 impl<'a> Parser<'a> {
-    pub fn new(token: &'a crypto::KeyStore) -> Self {
+    pub fn new(
+        token: &'a crypto::KeyStore,
+        prompt: &'a dyn prompt::Prompt,
+    ) -> Self {
         Self {
             channels: vec![],
             send_queue: VecDeque::new(),
             recv_queue: VecDeque::new(),
-            token: token,
+            token,
+            prompt,
         }
     }
 
@@ -392,6 +398,7 @@ impl<'a> Parser<'a> {
             cid: cid,
             state: State::Init,
             token: self.token,
+            prompt: self.prompt,
         };
         self.channels.push(channel);
         let response = InitResponse {
@@ -623,7 +630,7 @@ Allow? ",
             &args.user.name,
             &args.user.display_name
         );
-        let x = prompt::yes_or_no_p(&prompt);
+        let x = self.prompt.yes_or_no_p(&prompt);
         self.state = State::MakeCredential {
             args: args,
             consent: x,
@@ -761,7 +768,7 @@ Allow? ",
 Allow?",
             &args.rp_id
         );
-        let x = prompt::yes_or_no_p(&prompt);
+        let x = self.prompt.yes_or_no_p(&prompt);
         self.state = State::GetAssertion {
             args: args,
             consent: x,
@@ -886,7 +893,7 @@ Allow?",
         assert!(data.len() == 64);
         let challenge = &data[0..32];
         let application = &data[32..];
-        let consent = prompt::yes_or_no_p("Allow U2F registeration?");
+        let consent = self.prompt.yes_or_no_p("Allow U2F registeration?");
         match consent.recv_timeout(Duration::from_millis(10000)) {
             Ok(Ok(true)) => (),
             Ok(Ok(false))
@@ -986,7 +993,7 @@ Allow?",
             }
             3 => {
                 let consent =
-                    prompt::yes_or_no_p("Allow U2F authentication?");
+                    self.prompt.yes_or_no_p("Allow U2F authentication?");
                 match consent.recv_timeout(Duration::from_millis(10000)) {
                     Ok(Ok(true)) => (),
                     Ok(Ok(false))

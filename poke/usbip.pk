@@ -1,0 +1,96 @@
+
+// The USB/IP protocol is described at:
+// https://www.kernel.org/doc/Documentation/usb/usbip_protocol.txt
+
+// The version field uses two bytes for the binary-coded decimal USBIP
+// version number.  E.g.  0x0100 = v1.0.0
+
+load "util.pk";
+
+type BCDDigit = struct { nibble nibble : nibble <= 0x9; };
+
+type Version =
+  struct {
+    nibble reserved : reserved == 0; 
+    BCDDigit major;
+    BCDDigit minor;
+    BCDDigit patch;
+    method _print = void:
+    {
+      printf ("v%u4d.%u4d.%u4d", major.nibble, minor.nibble, patch.nibble);
+    }
+
+  };
+
+
+// A transfer usually involves of request and reply packet.
+
+var directionTags =
+  [
+    tag("REQUEST", 0x80),
+    tag("REPLY", 0x00),
+  ];
+
+type PktDirection =
+  struct {
+    byte tag : validTag(tag, directionTags);
+    method _print = void:
+    {
+      printTag(tag, directionTags);
+    }
+  };
+
+// There are various types of packets 
+
+var OP_REQ_IMPORT = 0x8003;
+var OP_REQ_DEVLIST =  0x8005;
+
+var pktCodes =
+  [
+    tag("REQ_IMPORT",  OP_REQ_IMPORT),
+    tag("REQ_DEVLIST", OP_REQ_DEVLIST),
+  ];
+
+type PktCode =
+  struct {
+    big uint<16> tag : validTag(tag as uint, pktCodes);
+    method _print = void:
+    {
+      printTag(tag, pktCodes);
+    }
+  };
+
+// All packages have a common header.  In the C header files this struct
+// is called op_common.
+type op_common =
+  struct {
+    Version version;
+    PktCode code;
+    big uint<32> status ;
+  };
+
+type BusId =
+  struct {
+    byte[32] busid;
+    method _print = void:
+    {
+      printf ("%v", string @ SELF'offset);
+    }
+  };
+
+type ImportRequest =
+  struct {
+    op_common header: header.code.tag == OP_REQ_IMPORT;
+    BusId busid;
+  };
+
+type DevlistRequest =
+  struct {
+    op_common header: header.code.tag == OP_REQ_DEVLIST;
+  };
+
+type Packet =
+  union {
+    ImportRequest importrequest;
+    DevlistRequest devlistrequest;
+  };
