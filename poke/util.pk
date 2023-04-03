@@ -7,13 +7,17 @@ fun tag = (string name, uint tag) TagName:
   return TagName{name=name, tag=tag};
 };
 
-fun printTag = (uint tag, TagNames ts) void:
+fun tagName = (uint tag, TagNames ts) string:
 {
   for (t in ts where t.tag == tag) {
-    printf ("%s",t.name);
-    return;
+    return t.name;
   };
   assert(0, format("invalid tag: %v (%v)", tag, ts));
+};
+
+fun printTag = (uint tag, TagNames ts) void:
+{
+  printf ("%s",tagName(tag, ts));
 };
 
 fun validTag = (uint tag, TagNames ts) uint:

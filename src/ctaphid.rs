@@ -20,7 +20,7 @@ type Q = VecDeque<Vec<u8>>;
 pub struct Parser<'a> {
     pub send_queue: Q,
     pub recv_queue: Q,
-    token: &'a crypto::KeyStore<'a>,
+    token: &'a crypto::Token<'a>,
     prompt: &'a dyn prompt::Prompt,
     channels: Vec<Channel<'a>>,
 }
@@ -28,7 +28,7 @@ pub struct Parser<'a> {
 struct Channel<'a> {
     cid: u32,
     prompt: &'a dyn prompt::Prompt,
-    token: &'a crypto::KeyStore<'a>,
+    token: &'a crypto::Token<'a>,
     state: State,
 }
 
@@ -312,7 +312,7 @@ impl<'de> serde::de::Visitor<'de> for BytesVisitor {
 
 impl<'a> Parser<'a> {
     pub fn new(
-        token: &'a crypto::KeyStore,
+        token: &'a crypto::Token,
         prompt: &'a dyn prompt::Prompt,
     ) -> Self {
         Self {

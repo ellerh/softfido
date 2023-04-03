@@ -1,14 +1,15 @@
 // Copyright: Helmut Eller
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use crate::usbip;
-use std::convert::TryFrom;
-use std::io::Read;
-use std::net::TcpStream;
-use usbip::bindings::{
+use crate::bindings::{
     usbip_header, EINPROGRESS, ENOENT, USBIP_CMD_SUBMIT, USBIP_CMD_UNLINK,
     USBIP_DIR_IN, USBIP_DIR_OUT,
 };
+use crate::usb;
+use crate::usbip;
+use std::convert::TryFrom;
+use std::io::{ErrorKind, Read};
+use std::net::TcpStream;
 
 type R<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -55,8 +56,8 @@ impl<'a, T> EventLoop<'a, T> {
         self.handlers
             .iter()
             .position(|h| match h {
-                Dev2Host(ep, _) => dev2host && *ep == endpoint,
-                Host2Dev(ep, _) => !dev2host && *ep == endpoint,
+                &Dev2Host(ep, _) => dev2host && ep == endpoint,
+                &Host2Dev(ep, _) => !dev2host && ep == endpoint,
             })
             .map(|pos| self.handlers.remove(pos))
     }
@@ -82,7 +83,12 @@ impl<'a, T> EventLoop<'a, T> {
 
     pub fn handle_commands(&mut self, stream: &mut TcpStream) -> R<()> {
         loop {
-            let header = usbip::read_cmd_header(stream)?;
+            let header = match usbip::read_cmd_header(stream) {
+                Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                    return Ok(())
+                }
+                e => e?,
+            };
             match u32::from_be(header.base.command) {
                 USBIP_CMD_SUBMIT => {
                     log!("CMD_SUBMIT");
@@ -124,7 +130,7 @@ impl<'a, T> EventLoop<'a, T> {
             seqnum,
             transfer_buffer_length
         );
-        assert!(transfer_flags & !usbip::URB_DIR_MASK == 0);
+        assert!(transfer_flags & !usb::URB_DIR_MASK == 0);
         //println!("transfer_buffer_length: {}", transfer_buffer_length);
         let mut v = vec![0u8; transfer_buffer_length];
         let h = self.remove_handler(endpoint, dev2host);
@@ -214,20 +220,13 @@ impl<'a, T> EventLoop<'a, T> {
         let beseqnum = unsafe { header.u.cmd_unlink.seqnum };
         let useqnum = u32::from_be(beseqnum);
         log!("CMD_UNLINK: seqnum: {} useqnum {} ", seqnum, useqnum);
-        use std::sync::atomic::{AtomicBool, Ordering};
-        let mut found = AtomicBool::new(false);
-        let f = |h: &usbip_header| -> bool {
-            match h.base.seqnum == beseqnum {
-                true => {
-                    found.store(true, Ordering::Relaxed);
-                    false
-                }
-                false => true,
-            }
-        };
-        self.blocked.retain(f);
-        self.unblocked.retain(f);
-        let status: i32 = match found.get_mut() {
+        let f = |h: &usbip_header| h.base.seqnum == beseqnum;
+        let nf = |h: &usbip_header| !f(h);
+        let found =
+            self.blocked.iter().any(f) || self.unblocked.iter().any(f);
+        self.blocked.retain(nf);
+        self.unblocked.retain(nf);
+        let status: i32 = match found {
             true => -(EINPROGRESS as i32),
             false => -(ENOENT as i32),
         };

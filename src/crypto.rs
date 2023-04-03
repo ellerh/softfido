@@ -17,7 +17,7 @@ use secrecy::{zeroize::Zeroize, SecretString};
 use std::convert::TryInto;
 use std::sync::{Mutex, MutexGuard};
 
-pub struct KeyStore<'a> {
+pub struct Token<'a> {
     s: Session,
     #[allow(dead_code)]
     // guard.drop unlocks the global mutex
@@ -37,7 +37,7 @@ pub fn open_token<'a>(
     module: &str,
     label: &str,
     pin: Pin,
-) -> R<KeyStore<'a>> {
+) -> R<Token<'a>> {
     let guard = MUTEX.lock()?;
     let path = std::path::Path::new(module);
     let mut pkcs11 = Pkcs11::new(path)?;
@@ -49,7 +49,7 @@ pub fn open_token<'a>(
     };
     // Note: open_rw_session clones pkcs11.
     let s = login(&pkcs11, slot, pin)?;
-    let token = KeyStore::<'a> { guard, s };
+    let token = Token::<'a> { guard, s };
     match token.find_secret_key()? {
         None => {
             log!("Generating secret key...");
@@ -188,7 +188,7 @@ fn der_encode_signature(points: &[u8]) -> Vec<u8> {
 const SECRET_KEY_LABEL: &str = "softfido-secret-key";
 const TOKEN_COUNTER_LABEL: &str = "softfido-token-counter";
 
-impl<'a> KeyStore<'a> {
+impl<'a> Token<'a> {
     fn find_secret_key(&self) -> R<Option<ObjectHandle>> {
         let attrs = &vec![
             A::Label(SECRET_KEY_LABEL.into()),
@@ -432,7 +432,7 @@ impl<'a> x509::SubjectPublicKeyInfo for EcSubjectPublicKeyInfo<'a> {
 pub mod tests {
     use super::R;
 
-    pub fn get_token<'a>() -> R<super::KeyStore<'a>> {
+    pub fn get_token<'a>() -> R<super::Token<'a>> {
         let lib = "/usr/lib/softhsm/libsofthsm2.so";
         let label = "test-softfido";
         let pin = String::from("fedcba");
