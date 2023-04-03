@@ -4,13 +4,19 @@
 use crate::bindings::*;
 use crate::binio::{read_struct, write_struct};
 use crate::crypto::Token;
-use crate::error::R;
+use crate::error::{IOR, R};
 use crate::eventloop;
 use crate::prompt::Prompt;
 use crate::usb;
 use std::io::{Error, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::raw::c_char;
+
+struct USBIPServer<'a> {
+    device: usb::Device<'a>,
+    input: TcpStream,
+    output: TcpStream,
+}
 
 const USBIP_VERSION: u16 = 0x0111;
 
@@ -26,46 +32,36 @@ fn op_common(code: u32) -> op_common {
     }
 }
 
-fn usb_device() -> usbip_usb_device {
+fn usb_device(dev: &usb::Device) -> usbip_usb_device {
     use std::array::from_fn;
+    let d = &dev.device_descriptor;
+    let c = &dev.config_descriptor;
     usbip_usb_device {
         path: from_fn(|i| *b"/frob/bar".get(i).unwrap_or(&0) as c_char),
         busid: from_fn(|i| *b"1-1".get(i).unwrap_or(&0) as c_char),
         busnum: 1u32.to_be(),
         devnum: 1u32.to_be(),
         speed: 2u32.to_be(),
-        idVendor: 0,
-        idProduct: 0,
-        bcdDevice: 0,
-        bDeviceClass: 0,
-        bDeviceSubClass: 0,
-        bDeviceProtocol: 0,
-        bConfigurationValue: 0,
-        bNumConfigurations: 1,
-        bNumInterfaces: 1,
+        idVendor: d.idVendor,
+        idProduct: d.idProduct,
+        bcdDevice: d.bcdDevice,
+        bDeviceClass: d.bDeviceClass,
+        bDeviceSubClass: d.bDeviceSubClass,
+        bDeviceProtocol: d.bDeviceProtocol,
+        bConfigurationValue: c.bConfigurationValue,
+        bNumConfigurations: d.bNumConfigurations,
+        bNumInterfaces: c.bNumInterfaces,
     }
 }
 
-fn usb_interface() -> usbip_usb_interface {
+fn usb_interface(dev: &usb::Device) -> usbip_usb_interface {
+    let i = &dev.interface_descriptor;
     usbip_usb_interface {
-        bInterfaceClass: 3u8.to_be(),
-        bInterfaceSubClass: 0u8.to_be(),
-        bInterfaceProtocol: 0u8.to_be(),
+        bInterfaceClass: i.bInterfaceClass,
+        bInterfaceSubClass: i.bInterfaceSubClass,
+        bInterfaceProtocol: i.bInterfaceProtocol,
         padding: 0u8.to_be(),
     }
-}
-
-pub fn write_op_rep_devlist(stream: &mut dyn Write) -> Result<(), Error> {
-    write_struct(stream, &op_common(OP_REP_DEVLIST))?;
-    write_struct(stream, &op_devlist_reply { ndev: 1u32.to_be() })?;
-    write_struct(stream, &usb_device())?;
-    write_struct(stream, &usb_interface())?;
-    Ok(())
-}
-
-pub fn write_op_rep_import(stream: &mut dyn Write) -> Result<(), Error> {
-    write_struct(stream, &op_common(OP_REP_IMPORT))?;
-    write_struct(stream, &usb_device())
 }
 
 pub fn write_submit_reply(
@@ -177,48 +173,74 @@ fn read_busid(stream: &mut dyn Read) -> Result<String, Error> {
     Ok(read_struct::<op_import_request>(stream)?.parse())
 }
 
-pub fn read_cmd_header(r: &mut dyn Read) -> Result<usbip_header, Error> {
-    read_struct(r)
+pub fn read_cmd_header(r: &mut dyn Read) -> IOR<Box<usbip_header>> {
+    Ok(Box::new(read_struct(r)?))
 }
 
 pub fn start_server(l: &TcpListener, t: &Token, p: &dyn Prompt) {
     for s in l.incoming() {
         println!("New connection {:?}\n", s);
-        handle_stream(&mut s.unwrap(), t, p).unwrap();
+        let dev = usb::Device::new(t, p);
+        serve(s.unwrap(), dev).unwrap();
     }
 }
 
-fn handle_stream(s: &mut TcpStream, t: &Token, p: &dyn Prompt) -> R<()> {
+fn serve(s: TcpStream, dev: usb::Device) -> R<()> {
     s.set_nodelay(true)?;
-    match read_op_common(s)? {
-        (USBIP_VERSION, OP_REQ_DEVLIST, 0) => {
-            println!("OP_REQ_DEVLIST");
-            write_op_rep_devlist(s)?;
-            s.shutdown(std::net::Shutdown::Both)?
-        }
-        (USBIP_VERSION, OP_REQ_IMPORT, 0) => {
-            println!("OP_REQ_IMPORT");
-            let busid = read_busid(s)?;
-            println!("busid: {}", busid);
-            assert!(busid == "1-1");
-            write_op_rep_import(s)?;
-            println!("import request busid {} complete", busid);
-            handle_commands(s, t, p)?
-        }
-        (version, code, status) => panic!(
-            "Unsupported packet: \
-	     version: 0x{:x} code: 0x{:x} status: 0x{:x}",
-            version, code, status
-        ),
-    }
-    Ok(())
+    let output = s.try_clone()?;
+    let mut server = USBIPServer {
+        device: dev,
+        input: s,
+        output: output,
+    };
+    server.start()
 }
 
-fn handle_commands(s: &mut TcpStream, t: &Token, p: &dyn Prompt) -> R<()> {
-    let mut dev = usb::Device::new(t, p);
-    let mut el = eventloop::EventLoop::new(&mut dev);
-    usb::Device::init_callbacks(&mut el);
-    el.handle_commands(s)
+impl<'a> USBIPServer<'a> {
+    fn start(&mut self) -> R<()> {
+        match read_op_common(&mut self.input)? {
+            (USBIP_VERSION, OP_REQ_DEVLIST, 0) => {
+                println!("OP_REQ_DEVLIST");
+                self.reply_devlist()?;
+                self.input.shutdown(std::net::Shutdown::Both)?
+            }
+            (USBIP_VERSION, OP_REQ_IMPORT, 0) => {
+                println!("OP_REQ_IMPORT");
+                let busid = read_busid(&mut self.input)?;
+                println!("busid: {}", busid);
+                assert!(busid == "1-1");
+                self.reply_import()?;
+                println!("import request busid {} complete", busid);
+                self.handle_commands()?
+            }
+            (version, code, status) => panic!(
+                "Unsupported packet: \
+		 version: 0x{:x} code: 0x{:x} status: 0x{:x}",
+                version, code, status
+            ),
+        }
+        Ok(())
+    }
+
+    fn reply_import(&mut self) -> IOR<()> {
+        let out = &mut self.output;
+        write_struct(out, &op_common(OP_REP_IMPORT))?;
+        write_struct(out, &usb_device(&self.device))
+    }
+
+    fn reply_devlist(&mut self) -> IOR<()> {
+        let out = &mut self.output;
+        write_struct(out, &op_common(OP_REP_DEVLIST))?;
+        write_struct(out, &op_devlist_reply { ndev: 1u32.to_be() })?;
+        write_struct(out, &usb_device(&self.device))?;
+        write_struct(out, &usb_interface(&self.device))
+    }
+
+    fn handle_commands(&mut self) -> R<()> {
+        let mut el = eventloop::EventLoop::new(&mut self.device);
+        usb::Device::init_callbacks(&mut el);
+        el.handle_commands(&mut self.input)
+    }
 }
 
 #[cfg(test)]
@@ -269,9 +291,10 @@ pub mod tests {
         let s = TcpStream::connect(addr).unwrap();
         let handle = std::thread::spawn(move || {
             let token = get_token().unwrap();
-            let mut s = listener.incoming().next().unwrap().unwrap();
-            handle_stream(&mut s, &token, &crate::prompt::Pinentry {})
-                .unwrap()
+            let prompt = &crate::prompt::Pinentry {};
+            let dev = usb::Device::new(&token, prompt);
+            let s = listener.incoming().next().unwrap().unwrap();
+            serve(s, dev).unwrap()
         });
         (s, handle)
     }

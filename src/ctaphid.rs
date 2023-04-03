@@ -5,9 +5,8 @@ use crate::crypto;
 use crate::prompt;
 use packed_struct::prelude::*;
 use packed_struct::PackedStruct;
-use serde::{
-    ser::SerializeMap, Deserialize, Deserializer, Serialize, Serializer,
-};
+use serde::ser::SerializeMap;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::min;
 use std::collections::VecDeque;
 use std::error::Error;

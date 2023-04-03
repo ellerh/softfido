@@ -158,14 +158,24 @@ struct usb_hid_descriptor {
 }
 
 pub struct Device<'a> {
-    device_descriptor: usb_device_descriptor,
-    config_descriptor: usb_config_descriptor,
-    interface_descriptor: usb_interface_descriptor,
+    pub device_descriptor: usb_device_descriptor,
+    pub config_descriptor: usb_config_descriptor,
+    pub interface_descriptor: usb_interface_descriptor,
     hid_descriptor: usb_hid_descriptor,
     hid_report_descriptor: Vec<u8>,
     endpoint_descriptors: Vec<usb_endpoint_descriptor>,
     strings: Vec<&'static str>,
     parser: ctaphid::Parser<'a>,
+}
+
+// USB Request Block
+pub struct URB<T> {
+    pub endpoint: u8,
+    pub setup: SetupPacket,
+    pub transfer_buffer: Vec<u8>,
+    pub complete: Option<Box<dyn FnOnce(Box<URB<T>>)>>,
+    pub context: Box<T>,
+    pub status: Option<R<bool>>, //bool is temporary
 }
 
 impl<'a> Device<'a> {
@@ -296,53 +306,69 @@ impl<'a> Device<'a> {
         }
     }
 
+    // pub fn submit(&mut self, urb: URB) -> R<bool> {
+    //     Ok(true)
+    // }
     pub fn init_callbacks(el: &mut eventloop::EventLoop<Device>) {
         let d2h = eventloop::Handler::Dev2Host(
             0,
-            |el: &mut eventloop::EventLoop<Device>,
-             setup: &[u8; 8],
-             data: &mut [u8]|
-             -> R<bool> {
-                el.state.ep0_dev2host(setup, data)?;
-                Ok(true)
+            |el: &mut eventloop::EventLoop<Device>, mut urb| {
+                let r = el
+                    .state
+                    .ep0_dev2host(urb.setup, &mut urb.transfer_buffer);
+                urb.status = Some(match r {
+                    Ok(()) => Ok(true),
+                    Err(e) => Err(e.into()),
+                });
+                let complete = urb.complete.take().unwrap();
+                complete(urb)
             },
         );
-        el.schedule(d2h).unwrap();
+        el.schedule(d2h);
         let h2d = eventloop::Handler::Host2Dev(
             0,
-            |el: &mut eventloop::EventLoop<Device>,
-             setup: &[u8; 8],
-             data: &[u8]|
-             -> R<bool> {
-                el.state.ep0_host2dev(setup, data)?;
-                Ok(true)
+            |el: &mut eventloop::EventLoop<Device>, mut urb| {
+                let r = el.state.ep0_host2dev(urb.setup);
+                urb.status = Some(match r {
+                    Ok(()) => Ok(true),
+                    Err(e) => Err(e.into()),
+                });
+                let complete = urb.complete.take().unwrap();
+                complete(urb)
             },
         );
-        el.schedule(h2d).unwrap();
+        el.schedule(h2d);
         let d2h1 = eventloop::Handler::Dev2Host(
             1,
-            |el: &mut eventloop::EventLoop<Device>,
-             _setup: &[u8; 8],
-             data: &mut [u8]| {
-                Ok(el.state.ep1_dev2host(data)?)
+            |el: &mut eventloop::EventLoop<Device>, mut urb| {
+                let r = el.state.ep1_dev2host(&mut urb.transfer_buffer);
+                urb.status = Some(match r {
+                    Err(e) => Err(e.into()),
+                    Ok(x) => Ok(x),
+                });
+                let complete = urb.complete.take().unwrap();
+                complete(urb)
             },
         );
-        el.schedule(d2h1).unwrap();
+        el.schedule(d2h1);
         let h2d2 = eventloop::Handler::Host2Dev(
             2,
-            |el: &mut eventloop::EventLoop<Device>,
-             _setup: &[u8; 8],
-             data: &[u8]| {
-                el.state.ep2_host2dev(data)?;
+            |el: &mut eventloop::EventLoop<Device>, mut urb| {
+                let r = el.state.ep2_host2dev(&urb.transfer_buffer);
                 if !el.state.parser.recv_queue.is_empty()
                     || !el.state.parser.send_queue.is_empty()
                 {
                     el.unblock_handler(1, true);
                 };
-                Ok(true)
+                urb.status = Some(match r {
+                    Err(e) => Err(e.into()),
+                    Ok(x) => Ok(x),
+                });
+                let complete = urb.complete.take().unwrap();
+                complete(urb);
             },
         );
-        el.schedule(h2d2).unwrap();
+        el.schedule(h2d2);
     }
 
     fn get_lang_descriptor(&self, sink: &mut dyn Write) -> IOR<()> {
@@ -423,8 +449,7 @@ impl<'a> Device<'a> {
         }
     }
 
-    fn ep0_dev2host(&self, setup: &[u8; 8], sink: &mut [u8]) -> IOR<()> {
-        let req = SetupPacket::unpack(setup).unwrap();
+    fn ep0_dev2host(&self, req: SetupPacket, sink: &mut [u8]) -> IOR<()> {
         match req.request_type() {
             (D2H, RT::Standard, RR::Device) => match req.std() {
                 SR::GetDescriptor => self.get_descriptor(req, sink),
@@ -443,8 +468,7 @@ impl<'a> Device<'a> {
         }
     }
 
-    fn ep0_host2dev(&self, setup: &[u8; 8], _data: &[u8]) -> IOR<()> {
-        let req = SetupPacket::unpack(setup).unwrap();
+    fn ep0_host2dev(&self, req: SetupPacket) -> IOR<()> {
         match req.request_type() {
             (H2D, RT::Standard, RR::Device) => match req.std() {
                 SR::SetConfiguration if req.args() == (0, 0, 0) => Ok(()),
@@ -485,7 +509,8 @@ fn test_get_device_descriptor() {
     let mut sink = [0u8; size_of::<usb_device_descriptor>()];
     const GET_DEVICE_DESCRIPTOR: &[u8; 8] =
         include_bytes!("../poke/get-device-descriptor.dat");
-    dev.ep0_dev2host(GET_DEVICE_DESCRIPTOR, &mut sink).unwrap();
+    let setup = SetupPacket::unpack(GET_DEVICE_DESCRIPTOR).unwrap();
+    dev.ep0_dev2host(setup, &mut sink).unwrap();
     let d = crate::binio::test::view_as::<usb_device_descriptor>(&sink);
     assert_eq!(d.bLength, size_of::<usb_device_descriptor>() as u8);
     assert_eq!(d.bDescriptorType, DT::Device.to_primitive());
