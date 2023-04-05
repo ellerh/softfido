@@ -3,7 +3,7 @@ use std::net::TcpListener;
 use std::sync::mpsc::Receiver;
 
 fn main() {
-    let token = crypto::open_token(
+    let token = crypto::Token::new(
         "/usr/lib/softhsm/libsofthsm2.so",
         "test-softfido",
         crypto::Pin::String(String::from("fedcba").into()),
@@ -12,7 +12,7 @@ fn main() {
     //let listener = TcpListener::bind("127.0.0.1:3240").unwrap();
     let listener = TcpListener::bind("0.0.0.0:3240").unwrap();
     println!("Softfido server is listening.");
-    usbip::start_server(&listener, &token, &ConfirmTests {})
+    usbip::start_server(&listener, token, Box::new(ConfirmTests {}))
 }
 
 struct ConfirmTests {}

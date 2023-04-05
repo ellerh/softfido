@@ -25,7 +25,7 @@ pub enum Handler<T> {
 use Handler::*;
 
 pub struct EventLoop<'a, T> {
-    pub state: &'a mut T,
+    pub state: &'a T,
     handlers: Vec<Handler<T>>,
 
     blocked: Vec<Box<usbip_header>>,
@@ -33,7 +33,7 @@ pub struct EventLoop<'a, T> {
 }
 
 impl<'a, T> EventLoop<'a, T> {
-    pub fn new(state: &'a mut T) -> EventLoop<'a, T> {
+    pub fn new(state: &'a T) -> EventLoop<'a, T> {
         EventLoop {
             state: state,
             handlers: Vec::new(),
@@ -133,19 +133,23 @@ impl<'a, T> EventLoop<'a, T> {
             Dev2Host(_ep, f) => {
                 let setup = usb::SetupPacket::unpack(&cmd.setup).unwrap();
                 let (tx, rx) = std::sync::mpsc::channel();
-                let reply = Box::new(move |urb| tx.send(urb).unwrap());
-                let urb = Box::new(usb::URB {
+                type F = Box<dyn FnOnce(Box<URB<usbip_header>>) + Send>;
+                let complete: F =
+                    Box::new(move |urb: Box<URB<usbip_header>>| {
+                        tx.send(urb).unwrap()
+                    });
+                let urb = Box::new(usb::URB::<usbip_header> {
                     setup,
                     transfer_buffer: v,
                     endpoint,
-                    complete: Some(reply),
+                    complete: Some(complete),
                     context: header,
                     status: None,
                 });
                 f(self, urb);
                 let urb = rx.recv()?;
-                match urb.status.unwrap() {
-                    Err(err) => {
+                match urb.status {
+                    Some(err) => {
                         println!("Request Error: {} {:?}", err, err);
                         usbip::write_submit_reply_error(
                             stream,
@@ -155,22 +159,13 @@ impl<'a, T> EventLoop<'a, T> {
                         //return Err(err)
                         Ok(())
                     }
-                    Ok(true) => {
+                    None => {
                         usbip::write_submit_reply(
                             stream,
                             &urb.context,
                             &urb.transfer_buffer,
                             None,
                         )?;
-                        self.schedule(h);
-                        Ok(())
-                    }
-                    Ok(false) => {
-                        log!(
-                            "queing request dev->host seqnum: {}",
-                            urb.context.base.seqnum()
-                        );
-                        self.blocked.push(urb.context);
                         self.schedule(h);
                         Ok(())
                     }
@@ -211,19 +206,19 @@ impl<'a, T> EventLoop<'a, T> {
         });
         f(self, urb);
         let urb = rx.recv()?;
-        match urb.status.unwrap() {
-            Err(err) => {
+        match urb.status {
+            Some(err) => {
                 panic!("Request Error: {:?}", err);
                 //usbip::write_submit_reply_error(stream, header)?
             }
-            x => {
+            None => {
                 usbip::write_submit_reply(
                     stream,
                     &urb.context,
                     &[0u8; 0],
                     Some(urb.transfer_buffer.len() as i32),
                 )?;
-                x
+                Ok(true)
             }
         }
     }
@@ -247,25 +242,5 @@ impl<'a, T> EventLoop<'a, T> {
         };
         usbip::write_unlink_reply(stream, &header, status)?;
         Ok(())
-    }
-}
-
-// Some accessors. Mostly to do the big-endian conversion.
-impl usbip_header_basic {
-    fn ep(&self) -> u8 {
-        match u32::from_be(self.ep) {
-            ep @ 0..=15 => ep as u8,
-            ep => panic!("Invalid endpoint: {}", ep),
-        }
-    }
-    fn direction(&self) -> bool {
-        match u32::from_be(self.direction) {
-            USBIP_DIR_OUT => false,
-            USBIP_DIR_IN => true,
-            dir => panic!("Invalid direction: {}", dir),
-        }
-    }
-    fn seqnum(&self) -> u32 {
-        u32::from_be(self.seqnum)
     }
 }

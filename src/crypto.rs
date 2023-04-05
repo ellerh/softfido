@@ -3,71 +3,30 @@
 
 use crate::error::R;
 use chrono::{DateTime, Utc};
-use cryptoki::{
-    context::Pkcs11,
-    error::Result as CResult,
-    mechanism::Mechanism as M,
-    object::{
-        Attribute as A, AttributeType, KeyType, ObjectClass, ObjectHandle,
-    },
-    session::Session,
-    slot::Slot,
-};
+use cryptoki::context::Pkcs11;
+use cryptoki::error::Result as CResult;
+use cryptoki::mechanism::Mechanism as M;
+use cryptoki::object::{Attribute as A, AttributeType};
+use cryptoki::object::{KeyType, ObjectClass, ObjectHandle};
+use cryptoki::session::Session;
+use cryptoki::slot::Slot;
 use secrecy::{zeroize::Zeroize, SecretString};
+use std::collections::HashMap;
 use std::convert::TryInto;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex};
 
-pub struct Token<'a> {
+#[derive(Debug)]
+struct KeyStore {
     s: Session,
-    #[allow(dead_code)]
-    // guard.drop unlocks the global mutex
-    guard: MutexGuard<'a, ()>,
+    // #[allow(dead_code)]
+    // // guard.drop unlocks the global mutex
+    // guard: MutexGuard<'a, ()>,
 }
 
-// Realistically, at most one session can be open at any time.
-static MUTEX: Mutex<()> = Mutex::new(());
-
-pub enum Pin<'a> {
-    Ask(&'a dyn Fn(&str) -> R<SecretString>),
+pub enum Pin {
+    Ask(Box<(dyn (FnOnce(&str) -> R<SecretString>) + Send + Sync)>),
     String(SecretString),
     File(String),
-}
-
-pub fn open_token<'a>(
-    module: &str,
-    label: &str,
-    pin: Pin,
-) -> R<Token<'a>> {
-    let guard = MUTEX.lock()?;
-    let path = std::path::Path::new(module);
-    let mut pkcs11 = Pkcs11::new(path)?;
-    pkcs11.initialize(cryptoki::context::CInitializeArgs::OsThreads)?;
-    let slot = match find_token(&pkcs11, label)?[..] {
-        [slot] => slot,
-        [] => Err("No token with matching label found")?,
-        _ => Err("Multiple tokens with matching label found")?,
-    };
-    // Note: open_rw_session clones pkcs11.
-    let s = login(&pkcs11, slot, pin)?;
-    let token = Token::<'a> { guard, s };
-    match token.find_secret_key()? {
-        None => {
-            log!("Generating secret key...");
-            token.create_secret_key()?
-        }
-        _ => log!("Found secret key."),
-    };
-    match token.find_token_counter()? {
-        None => {
-            log!("Generating token counter...");
-            token.create_token_counter(0)?
-        }
-        _ => log!(
-            "Found token counter. ({})",
-            token.increment_token_counter()?
-        ),
-    };
-    Ok(token)
 }
 
 fn find_token(pkcs11: &Pkcs11, label: &str) -> CResult<Vec<Slot>> {
@@ -94,8 +53,7 @@ fn login(p: &Pkcs11, slot: Slot, pin: Pin) -> R<Session> {
         (true, Pin::File(filename)) => read_pin_file(&filename)?,
         (true, Pin::String(s)) => s,
     };
-    s.login(cryptoki::session::UserType::User, need_pin.then(|| &pin))
-        .map_err(|e| format!("login failed: {}", &e))?;
+    s.login(cryptoki::session::UserType::User, need_pin.then(|| &pin))?;
     Ok(s)
 }
 
@@ -188,7 +146,57 @@ fn der_encode_signature(points: &[u8]) -> Vec<u8> {
 const SECRET_KEY_LABEL: &str = "softfido-secret-key";
 const TOKEN_COUNTER_LABEL: &str = "softfido-token-counter";
 
-impl<'a> Token<'a> {
+fn get_pkcs11(module: &str) -> R<Pkcs11> {
+    use cryptoki::context::CInitializeArgs;
+    use std::path::PathBuf;
+    static PKCS11: Mutex<Option<HashMap<PathBuf, Pkcs11>>> =
+        Mutex::new(None);
+    let pbuf = std::fs::canonicalize(module)?;
+    let mut opt = PKCS11.lock().unwrap();
+    let map = opt.get_or_insert_with(HashMap::new);
+    match map.get(&pbuf) {
+        Some(p) => Ok(p.clone()),
+        None => {
+            let mut pkcs11 = Pkcs11::new(pbuf.clone())?;
+            pkcs11.initialize(CInitializeArgs::OsThreads)?;
+            map.insert(pbuf, pkcs11.clone());
+            Ok(pkcs11)
+        }
+    }
+}
+
+impl KeyStore {
+    fn open(module: &str, label: &str, pin: Pin) -> R<KeyStore> {
+        //let guard = MUTEX.lock().map_err(|e| e.to_string())?;
+        let pkcs11 = get_pkcs11(module)?;
+        let slot = match find_token(&pkcs11, label)?[..] {
+            [slot] => slot,
+            [] => Err("No token with matching label found")?,
+            _ => Err("Multiple tokens with matching label found")?,
+        };
+        // Note: open_rw_session clones pkcs11.
+        let s = login(&pkcs11, slot, pin)?;
+        let token = KeyStore { s };
+        match token.find_secret_key()? {
+            None => {
+                log!("Generating secret key...");
+                token.create_secret_key()?
+            }
+            _ => log!("Found secret key."),
+        };
+        match token.find_token_counter()? {
+            None => {
+                log!("Generating token counter...");
+                token.create_token_counter(0)?
+            }
+            _ => log!(
+                "Found token counter. ({})",
+                token.increment_token_counter()?
+            ),
+        };
+        Ok(token)
+    }
+
     fn find_secret_key(&self) -> R<Option<ObjectHandle>> {
         let attrs = &vec![
             A::Label(SECRET_KEY_LABEL.into()),
@@ -428,15 +436,73 @@ impl<'a> x509::SubjectPublicKeyInfo for EcSubjectPublicKeyInfo<'a> {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct Token(Arc<Mutex<KeyStore>>);
+
+impl Token {
+    pub fn new(module: &str, label: &str, pin: Pin) -> R<Token> {
+        Ok(Token(Arc::new(Mutex::new(KeyStore::open(
+            &module, &label, pin,
+        )?))))
+    }
+    pub fn increment_token_counter(&self) -> CResult<u32> {
+        self.0.lock().unwrap().increment_token_counter()
+    }
+    pub fn sha256_hash(&self, data: &[u8]) -> CResult<Vec<u8>> {
+        self.0.lock().unwrap().sha256_hash(data)
+    }
+    pub fn generate_key_pair(&self) -> R<(Vec<u8>, (Vec<u8>, Vec<u8>))> {
+        self.0.lock().unwrap().generate_key_pair()
+    }
+    pub fn is_valid_id(&self, key: &[u8]) -> bool {
+        self.0.lock().unwrap().is_valid_id(key)
+    }
+    pub fn sign(&self, key: &[u8], data: &[u8]) -> R<Vec<u8>> {
+        self.0.lock().unwrap().sign(key, data)
+    }
+    pub fn encrypt(&self, data: &[u8]) -> R<Vec<u8>> {
+        self.0.lock().unwrap().encrypt(data)
+    }
+    pub fn decrypt(&self, data: &[u8]) -> R<Vec<u8>> {
+        self.0.lock().unwrap().decrypt(data)
+    }
+    pub fn create_certificate(
+        &self,
+        wrapped_priv_key: &[u8],
+        pub_key: &[u8],
+        issuer: &str,
+        subject: &str,
+        not_before: DateTime<Utc>,
+        not_after: Option<DateTime<Utc>>,
+    ) -> R<Vec<u8>> {
+        self.0.lock().unwrap().create_certificate(
+            wrapped_priv_key,
+            pub_key,
+            issuer,
+            subject,
+            not_before,
+            not_after,
+        )
+    }
+}
+
 #[cfg(test)]
 pub mod tests {
-    use super::R;
+    use super::*;
 
-    pub fn get_token<'a>() -> R<super::Token<'a>> {
+    fn test_token() -> R<Token> {
         let lib = "/usr/lib/softhsm/libsofthsm2.so";
         let label = "test-softfido";
-        let pin = String::from("fedcba");
-        super::open_token(lib, label, super::Pin::String(pin.into()))
+        let pin = Pin::String(String::from("fedcba").into());
+        Ok(Token::new(lib, label, pin)?)
+    }
+
+    fn get_token() -> R<Token> {
+        static TOKEN: Mutex<Option<Token>> = Mutex::new(None);
+        match &mut *TOKEN.lock().unwrap() {
+            Some(t) => Ok(t.clone()),
+            opt @ None => Ok(opt.insert(test_token()?).clone()),
+        }
     }
 
     #[test]
@@ -453,6 +519,34 @@ pub mod tests {
         get_token()?;
         get_token()?;
         get_token()?;
+        Ok(())
+    }
+
+    #[test]
+    fn open_token3() -> R<()> {
+        use cryptoki::error::Error;
+        use cryptoki::error::RvError::UserAlreadyLoggedIn;
+        fn is_already_logged_in_error(x: R<Token>) -> bool {
+            match x {
+                Ok(_) => false,
+                Err(b) => match b.downcast::<Error>() {
+                    Ok(e) => {
+                        matches!(
+                            e.as_ref(),
+                            Error::Pkcs11(UserAlreadyLoggedIn)
+                        )
+                    }
+                    _ => false,
+                },
+            }
+        }
+        let t1 = test_token();
+        let t2 = test_token();
+        eprint!("t1={:?}\nt2={:?}\n", t1, t2);
+        assert!(
+            is_already_logged_in_error(t1)
+                || is_already_logged_in_error(t2)
+        );
         Ok(())
     }
 

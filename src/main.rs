@@ -1,7 +1,7 @@
 // Copyright: Helmut Eller
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use softfido::{crypto::open_token, crypto::Pin, prompt, usbip};
+use softfido::{crypto::Pin, crypto::Token, prompt, usbip};
 use std::net::TcpListener;
 
 struct Args {
@@ -12,16 +12,17 @@ struct Args {
 
 fn main() {
     let args = parse_args();
-    let token = open_token(
+    let token = Token::new(
         &args.pkcs11_module,
         args.token_label.as_ref(),
-        args.pin_file.map_or(Pin::Ask(&prompt::read_pin), Pin::File),
+        args.pin_file
+            .map_or(Pin::Ask(Box::new(prompt::read_pin)), Pin::File),
     )
     .unwrap_or_else(|e| panic!("Failed to open token: {}", e));
     let listener = TcpListener::bind("127.0.0.1:3240").unwrap();
     //let listener = TcpListener::bind("0.0.0.0:3240").unwrap();
     println!("Softfido server is listening.");
-    usbip::start_server(&listener, &token, &prompt::Pinentry {})
+    usbip::start_server(&listener, token, Box::new(prompt::Pinentry {}))
 }
 
 fn default_args() -> Args {

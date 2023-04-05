@@ -7,7 +7,7 @@ use pinentry;
 use secrecy::SecretString;
 use std::sync::mpsc::Receiver;
 
-pub trait Prompt {
+pub trait Prompt: Send {
     fn yes_or_no_p(&self, prompt: &str) -> Receiver<Result<bool, String>>;
 }
 

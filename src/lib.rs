@@ -7,9 +7,10 @@ mod macros;
 
 mod binio;
 pub mod crypto;
+#[allow(unused_variables, dead_code)]
 mod ctaphid;
 mod error;
-mod eventloop;
+//mod eventloop;
 mod hid;
 pub mod prompt;
 mod usb;

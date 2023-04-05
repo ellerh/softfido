@@ -7,9 +7,10 @@ SSH=ssh -p 2222 user@127.0.0.1
 HOSTIP=$(word 1,$(shell hostname -I))
 
 check: ensure-vm-running build-test-server
+	set -e ; \
 	cargo run --bin test-server \
 	2>/tmp/test-server.stderr >/tmp/test-server.stdout & \
-        trap "kill $$!" EXIT && \
+        trap "kill $$!" EXIT 15 2 ; \
 	until grep -q listening /tmp/test-server.stdout ; do \
 	   sleep 0.2 ; \
         done && \

@@ -1,17 +1,14 @@
 use crate::bindings::*;
 use crate::binio::{write_struct, write_struct_limited};
-use crate::crypto::Token;
-use crate::ctaphid;
 use crate::error::{IOR, R};
-use crate::eventloop;
 use crate::hid;
-use crate::prompt;
 use packed_struct::prelude::*;
-use packed_struct::PackedStruct;
+//use packed_struct::PackedStruct;
 use packed_struct::PrimitiveEnum;
 use std::convert::TryFrom;
 use std::io::Write;
 use std::mem::size_of;
+use std::sync::mpsc::Sender;
 
 const LANG_ID_EN_US: u16 = 0x0409;
 
@@ -41,6 +38,9 @@ impl SetupPacket {
             self.bm_request_type.type_,
             self.bm_request_type.recipient,
         )
+    }
+    fn direction(self) -> DataTransferDirection {
+        self.bm_request_type.direction
     }
     fn args(self) -> (u16, u16, u16) {
         (
@@ -157,7 +157,7 @@ struct usb_hid_descriptor {
     // ... optional other descriptors type/length pairs
 }
 
-pub struct Device<'a> {
+pub struct Device {
     pub device_descriptor: usb_device_descriptor,
     pub config_descriptor: usb_config_descriptor,
     pub interface_descriptor: usb_interface_descriptor,
@@ -165,21 +165,27 @@ pub struct Device<'a> {
     hid_report_descriptor: Vec<u8>,
     endpoint_descriptors: Vec<usb_endpoint_descriptor>,
     strings: Vec<&'static str>,
-    parser: ctaphid::Parser<'a>,
+    endpoints: Vec<Sender<Box<URB>>>,
 }
 
 // USB Request Block
-pub struct URB<T> {
+pub struct URB {
     pub endpoint: u8,
     pub setup: SetupPacket,
     pub transfer_buffer: Vec<u8>,
-    pub complete: Option<Box<dyn FnOnce(Box<URB<T>>)>>,
-    pub context: Box<T>,
-    pub status: Option<R<bool>>, //bool is temporary
+    pub complete: Option<Box<dyn FnOnce(Box<URB>, i32) + Send>>,
+    pub status: Option<i32>,
 }
 
-impl<'a> Device<'a> {
-    pub fn new(token: &'a Token, prompt: &'a dyn prompt::Prompt) -> Self {
+impl URB {
+    pub fn complete(mut self: Box<Self>, status: i32) {
+        let complete = self.complete.take().unwrap();
+        complete(self, status);
+    }
+}
+
+impl Device {
+    pub fn new(endpoints: Vec<Sender<Box<URB>>>) -> Self {
         let hid_report_descriptor: Vec<u8> = {
             use hid::*;
             [
@@ -264,7 +270,7 @@ impl<'a> Device<'a> {
                     as u16)
                     .to_le(),
             },
-            hid_report_descriptor: hid_report_descriptor,
+            hid_report_descriptor,
             endpoint_descriptors: vec![
                 usb_endpoint_descriptor {
                     bLength: USB_DT_ENDPOINT_SIZE as u8,
@@ -302,73 +308,23 @@ impl<'a> Device<'a> {
                 "Default Config",
                 "The Interface",
             ],
-            parser: ctaphid::Parser::new(token, prompt),
+            endpoints,
         }
     }
 
-    // pub fn submit(&mut self, urb: URB) -> R<bool> {
-    //     Ok(true)
-    // }
-    pub fn init_callbacks(el: &mut eventloop::EventLoop<Device>) {
-        let d2h = eventloop::Handler::Dev2Host(
-            0,
-            |el: &mut eventloop::EventLoop<Device>, mut urb| {
-                let r = el
-                    .state
-                    .ep0_dev2host(urb.setup, &mut urb.transfer_buffer);
-                urb.status = Some(match r {
-                    Ok(()) => Ok(true),
-                    Err(e) => Err(e.into()),
-                });
-                let complete = urb.complete.take().unwrap();
-                complete(urb)
-            },
-        );
-        el.schedule(d2h);
-        let h2d = eventloop::Handler::Host2Dev(
-            0,
-            |el: &mut eventloop::EventLoop<Device>, mut urb| {
-                let r = el.state.ep0_host2dev(urb.setup);
-                urb.status = Some(match r {
-                    Ok(()) => Ok(true),
-                    Err(e) => Err(e.into()),
-                });
-                let complete = urb.complete.take().unwrap();
-                complete(urb)
-            },
-        );
-        el.schedule(h2d);
-        let d2h1 = eventloop::Handler::Dev2Host(
-            1,
-            |el: &mut eventloop::EventLoop<Device>, mut urb| {
-                let r = el.state.ep1_dev2host(&mut urb.transfer_buffer);
-                urb.status = Some(match r {
-                    Err(e) => Err(e.into()),
-                    Ok(x) => Ok(x),
-                });
-                let complete = urb.complete.take().unwrap();
-                complete(urb)
-            },
-        );
-        el.schedule(d2h1);
-        let h2d2 = eventloop::Handler::Host2Dev(
-            2,
-            |el: &mut eventloop::EventLoop<Device>, mut urb| {
-                let r = el.state.ep2_host2dev(&urb.transfer_buffer);
-                if !el.state.parser.recv_queue.is_empty()
-                    || !el.state.parser.send_queue.is_empty()
-                {
-                    el.unblock_handler(1, true);
-                };
-                urb.status = Some(match r {
-                    Err(e) => Err(e.into()),
-                    Ok(x) => Ok(x),
-                });
-                let complete = urb.complete.take().unwrap();
-                complete(urb);
-            },
-        );
-        el.schedule(h2d2);
+    pub fn submit(&self, mut urb: Box<URB>) -> R<()> {
+        match (urb.endpoint, urb.setup.direction()) {
+            (0, D2H) => {
+                self.ep0_dev2host(urb.setup, &mut urb.transfer_buffer)?;
+                urb.complete(0)
+            }
+            (0, H2D) => {
+                self.ep0_host2dev(urb.setup)?;
+                urb.complete(0)
+            }
+            (n, _) => self.endpoints[n as usize - 1].send(urb).unwrap(),
+        };
+        Ok(())
     }
 
     fn get_lang_descriptor(&self, sink: &mut dyn Write) -> IOR<()> {
@@ -482,30 +438,30 @@ impl<'a> Device<'a> {
         }
     }
 
-    fn ep1_dev2host(&mut self, buf: &mut [u8]) -> R<bool> {
-        log!("ep1 dev->host");
-        while !self.parser.recv_queue.is_empty() {
-            self.parser.parse()?
-        }
-        if !self.parser.send_queue.is_empty() {
-            self.parser.unparse(buf)?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
+    // fn ep1_dev2host(&self, _buf: &mut [u8]) -> R<bool> {
+    //     log!("ep1 dev->host");
+    //     // while !self.parser.recv_queue.is_empty() {
+    //     //     self.parser.parse()?
+    //     // }
+    //     // if !self.parser.send_queue.is_empty() {
+    //     //     self.parser.unparse(buf)?;
+    //     //     Ok(true)
+    //     // } else {
+    //     //     Ok(false)
+    //     // }
+    //     Ok(true)
+    // }
 
-    fn ep2_host2dev(&mut self, data: &[u8]) -> R<bool> {
-        log!("ep2 host->dev");
-        self.parser.recv_queue.push_back(data.to_vec());
-        Ok(true)
-    }
+    // fn ep2_host2dev(&self, _data: &[u8]) -> R<bool> {
+    //     log!("ep2 host->dev");
+    //     //self.parser.recv_queue.push_back(data.to_vec());
+    //     Ok(true)
+    // }
 }
 
 #[test]
 fn test_get_device_descriptor() {
-    let token = crate::crypto::tests::get_token().unwrap();
-    let dev = Device::new(&token, &prompt::Pinentry {});
+    let dev = Device::new(vec![]);
     let mut sink = [0u8; size_of::<usb_device_descriptor>()];
     const GET_DEVICE_DESCRIPTOR: &[u8; 8] =
         include_bytes!("../poke/get-device-descriptor.dat");
