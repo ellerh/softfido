@@ -22,7 +22,7 @@ fn main() {
     let listener = TcpListener::bind("127.0.0.1:3240").unwrap();
     //let listener = TcpListener::bind("0.0.0.0:3240").unwrap();
     println!("Softfido server is listening.");
-    usbip::start_server(&listener, token, Box::new(prompt::Pinentry {}))
+    usbip::start_server(&listener, token, prompt::yes_or_no_p)
 }
 
 fn default_args() -> Args {

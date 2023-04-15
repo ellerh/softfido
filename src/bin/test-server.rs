@@ -1,6 +1,5 @@
-use softfido::{crypto, prompt, usbip};
+use softfido::{crypto, usbip};
 use std::net::TcpListener;
-use std::sync::mpsc::Receiver;
 
 fn main() {
     let token = crypto::Token::new(
@@ -12,23 +11,21 @@ fn main() {
     //let listener = TcpListener::bind("127.0.0.1:3240").unwrap();
     let listener = TcpListener::bind("0.0.0.0:3240").unwrap();
     println!("Softfido server is listening.");
-    usbip::start_server(&listener, token, Box::new(ConfirmTests {}))
+    usbip::start_server(&listener, token, yes_or_no_p)
 }
 
-struct ConfirmTests {}
-
-impl prompt::Prompt for ConfirmTests {
-    fn yes_or_no_p(&self, prompt: &str) -> Receiver<Result<bool, String>> {
-        let timeout_test = prompt.contains("Please don't confirm");
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            if timeout_test {
-                std::thread::sleep(std::time::Duration::from_secs(20));
-                Ok(())
-            } else {
-                sender.send(Ok(true))
-            }
-        });
-        receiver
+fn yes_or_no_p(prompt: &str) -> Result<bool, String> {
+    let c = |pat| prompt.contains(pat);
+    if c("timeout.com") {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        Err("timed out".to_string())
+    } else if (c("test-deny-credentials") && c("registration credentials"))
+        || (c("test-deny-challenge") && c("signing challenge"))
+    {
+        Ok(false)
+    } else if c("test-close-window") && c("registration credentials") {
+        Err("window closed".to_string())
+    } else {
+        Ok(true)
     }
 }

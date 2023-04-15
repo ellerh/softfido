@@ -2,66 +2,49 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 use crate::crypto::Token;
-use crate::error;
-use crate::prompt::Prompt;
 use crate::usb;
-use error::R;
 use packed_struct::prelude::*;
 use packed_struct::PackedStruct;
 use serde::ser::SerializeMap;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::cmp::min;
-use std::collections::VecDeque;
-use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::mpsc;
+use std::sync::mpsc::{Receiver, RecvError, RecvTimeoutError, Sender};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use usb::URB;
 
-type QPort = Sender<Vec<u8>>;
-type Q = VecDeque<Vec<u8>>;
-type P = Arc<Mutex<Box<dyn Prompt>>>;
+pub type Prompt = fn(&str) -> Result<bool, String>;
+type QPort = Sender<Pkt>;
 
 pub struct Parser {
-    //pub send_queue: Q,
-    //pub recv_queue: Q,
-    //pub in_port: Sender<Box<URB>>,
-    //pub out_port: Sender<Box<URB>>,
-    input: Receiver<Box<URB>>,
+    input_rx: Receiver<ParserInput>,
+    input_tx: Sender<ParserInput>,
     queue_port: QPort,
     token: Token,
-    prompt: P,
-    channels: Vec<Channel>,
+    prompt: Prompt,
+    cid_counter: u32,
+    tag_counter: Tag,
 }
 
-struct Channel {
-    cid: u32,
-    prompt: P,
-    token: Token,
-    state: State,
-    queue_port: QPort,
+type Tag = usize;
+
+#[derive(Debug)]
+enum ParserInput {
+    Asm(AR),
+    Status(TransactionStatus),
+    Consent(bool, Tag),
 }
 
 #[derive(Debug)]
-enum State {
-    Init,
-    Cont {
-        cmd: u8,
-        bcnt: u16,
-        buffer: Vec<u8>,
-        seqnum: u8,
-    },
-    MakeCredential {
-        args: MakeCredentialArgs,
-        consent: Receiver<Result<bool, String>>,
-    },
-    GetAssertion {
-        args: GetAssertionArgs,
-        consent: Receiver<Result<bool, String>>,
-    },
+enum TransactionStatus {
+    Done(Vec<u8>),
+    ConsentNeeded(String, Sender<Result<bool, ()>>),
 }
 
-const MAX_PACKET_SIZE: u16 = 64;
+const PACKET_SIZE: usize = 64;
+const INIT_SIZE: usize = PACKET_SIZE - 7;
+const CONT_SIZE: usize = PACKET_SIZE - 5;
 
 const CTAPHID_BROADCAST_CID: u32 = 0xFFFFFFFF;
 
@@ -72,23 +55,22 @@ const CTAPHID_CBOR: u8 = 0x10;
 const CTAPHID_MSG: u8 = 0x03;
 const CTAPHID_ERROR: u8 = 0x3F;
 const CTAPHID_KEEPALIVE: u8 = 0x3B;
-const CTAPHID_VENDOR_FIRST: u8 = 0x40;
-const HACK_CHECK_STATUS: u8 = CTAPHID_VENDOR_FIRST + 10;
+//const CTAPHID_VENDOR_FIRST: u8 = 0x40;
 
 //const CAPABILITY_WINK: u8 = 0x01;
 const CAPABILITY_CBOR: u8 = 0x04;
-const CAPABILITY_NMSG: u8 = 0x08;
+//const CAPABILITY_NMSG: u8 = 0x08;
 
 const CTAP1_ERR_SUCCESS: u8 = 0x00;
 const CTAP2_GET_INFO: u8 = 0x04;
 const CTAP2_MAKE_CREDENTIAL: u8 = 0x01;
 const CTAP2_GET_ASSERTION: u8 = 0x02;
 
+const STATUS_PROCESSING: u8 = 1;
 const STATUS_UPNEEDED: u8 = 2;
 
-const ERR_INVALID_CMD: u8 = 0x01;
-const ERR_INVALID_PAR: u8 = 0x02;
-#[allow(dead_code)]
+//const ERR_INVALID_CMD: u8 = 0x01;
+//const ERR_INVALID_PAR: u8 = 0x02;
 const ERR_BUSY: u8 = 0x06;
 #[allow(dead_code)]
 const ERR_INVALID_CHANNEL: u8 = 0x0B;
@@ -96,7 +78,6 @@ const ERR_OPERATION_DENIED: u8 = 0x27;
 const ERR_INVALID_CREDENTIAL: u8 = 0x22;
 //const ERR_INVALID_OPTION: u8 = 0x2C;
 const ERR_INVALID_CBOR: u8 = 0x12;
-#[allow(dead_code)]
 const ERR_KEEPALIVE_CANCEL: u8 = 0x2D;
 
 const SW_NO_ERROR: u16 = 0x9000;
@@ -104,13 +85,11 @@ const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 //const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 const SW_WRONG_DATA: u16 = 0x6A80;
 
+const PROTOCOL_VERSION: u8 = 2;
+
 #[derive(PackedStruct, Debug)]
-#[packed_struct(endian = "lsb")]
+#[packed_struct(endian = "msb")]
 pub struct InitResponse {
-    channel: u32,
-    cmd: u8,
-    #[packed_field(endian = "msb")]
-    bcnt: u16,
     nonce: [u8; 8],
     channelid: u32,
     protocol_version: u8,
@@ -127,9 +106,10 @@ const AAGUID: u128 = 0x7ec96c58403748ed8e7eb2a1b538374e;
 type Cbor = serde_cbor::value::Value;
 
 #[derive(Debug, Serialize)]
+#[cfg_attr(test, derive(Deserialize))]
 struct GetInfoResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
-    _marker: Option<()>,
+    _padding: Option<()>,
     versions: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     extensions: Option<Vec<String>>,
@@ -141,7 +121,7 @@ struct Bytes(Vec<u8>);
 
 #[derive(Debug, Deserialize)]
 struct MakeCredentialArgs {
-    _marker: Option<()>,
+    _padding: Option<()>,
     #[allow(dead_code)]
     client_data_hash: Bytes,
     rp: RelyingParty,
@@ -179,12 +159,11 @@ struct PublicKeyCredentialParameters {
     alg: i32,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 struct PublicKeyCredentialDescriptor {
     r#type: String,
     id: Bytes,
     #[serde(default)]
-    #[serde(skip_serializing_if = "Vec::is_empty")]
     transports: Vec<String>,
 }
 
@@ -198,7 +177,7 @@ struct MakeCredentialArgsOptions {
 #[derive(Debug, Serialize)]
 struct MakeCredentialResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
-    _marker: Option<()>,
+    _padding: Option<()>,
     fmt: String,
     auth_data: Bytes,
     att_stmt: std::collections::BTreeMap<i8, i8>,
@@ -215,7 +194,7 @@ struct CoseKey {
 
 #[derive(Debug, Deserialize)]
 struct GetAssertionArgs {
-    _marker: Option<()>,
+    _padding: Option<()>,
     rp_id: String,
     client_data_hash: Bytes,
     #[serde(default)]
@@ -248,7 +227,7 @@ fn up_default() -> bool {
 #[derive(Debug, Serialize)]
 struct GetAssertionResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
-    _marker: Option<()>,
+    _padding: Option<()>,
     #[serde(skip_serializing_if = "Option::is_none")]
     credential: Option<PublicKeyCredentialDescriptor>,
     auth_data: Bytes,
@@ -281,6 +260,30 @@ impl Serialize for CoseKey {
         let mut map = serializer.serialize_map(Some(entries.len()))?;
         for (k, v) in entries.iter() {
             map.serialize_entry(k, v)?;
+        }
+        map.end()
+    }
+}
+
+impl Serialize for PublicKeyCredentialDescriptor {
+    fn serialize<S: Serializer>(
+        &self,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        use serde_cbor::value::Value::*;
+        let mut entries = vec![
+            ("id", Bytes(self.id.0.clone())),
+            ("type", Text(self.r#type.clone())),
+        ];
+        if self.transports.len() > 0 {
+            let strings =
+                self.transports.iter().map(|s| Text(s.clone())).collect();
+            entries.insert(1, ("transports", Array(strings)));
+            todo!()
+        }
+        let mut map = serializer.serialize_map(Some(entries.len()))?;
+        for (k, v) in entries.iter() {
+            map.serialize_entry(&Text(k.to_string()), v)?;
         }
         map.end()
     }
@@ -320,23 +323,230 @@ impl<'de> serde::de::Visitor<'de> for BytesVisitor {
     }
 }
 
-fn output_loop(
-    output: Receiver<Box<URB>>,
-    queue: Receiver<Vec<u8>>,
-) -> R<()> {
+fn output_loop(output: Receiver<Box<URB>>, queue: Receiver<Pkt>) {
     log!("start output loop");
-    loop {
-        let mut urb = output.recv()?;
-        log!("output urb: {}", urb.transfer_buffer.len());
-        match queue.recv() {
-            Err(_) => return Ok(()),
-            Ok(r) => {
-                log!("queued output");
-                let pkt = &mut urb.transfer_buffer;
-                assert!(r.len() <= pkt.len());
-                pkt[..r.len()].copy_from_slice(&r[..]);
-                urb.complete(0)
+    for pkt in queue {
+        let mut buf = Some(pkt.into());
+        loop {
+            let urb = output.recv().unwrap();
+            log!("output urb");
+            match urb.complete(buf) {
+                Ok(None) => break,
+                Ok(_) => panic!("complete() returned a buffer"),
+                Err(usb::CompletionError::Unlinked(b)) => {
+                    log!("skipping unlinked urb");
+                    buf = b;
+                    continue;
+                }
             }
+        }
+    }
+    log!("output loop finished");
+}
+
+type Pkt = [u8; PACKET_SIZE];
+struct InitializationPacket<'a>(&'a Pkt);
+struct ContinuationPacket<'a>(&'a Pkt);
+
+impl<'a> InitializationPacket<'a> {
+    fn write(pkt: &mut Pkt, cid: u32, cmd: u8, bcnt: u16, data: &[u8]) {
+        pkt[0..4].copy_from_slice(cid.to_be_bytes().as_slice());
+        pkt[4] = cmd | (1 << 7);
+        pkt[5..7].copy_from_slice(bcnt.to_be_bytes().as_slice());
+        pkt[7..7 + data.len()].copy_from_slice(data);
+    }
+    fn cid(&self) -> u32 {
+        u32::from_be_bytes(self.0[..4].try_into().unwrap())
+    }
+    fn cmd(&self) -> (bool, u8) {
+        let cmdbyte = self.0[4];
+        // in continuation packets, the highest bit is cleared
+        let is_cont = (cmdbyte >> 7) == 0;
+        let cmd = cmdbyte & !(1 << 7);
+        (is_cont, cmd)
+    }
+    fn data(&self) -> (usize, &[u8]) {
+        let bcnt = u16::from_be_bytes([self.0[5], self.0[6]]) as usize;
+        (bcnt, &self.0[7..min(7 + bcnt, PACKET_SIZE)])
+    }
+}
+
+impl<'a> ContinuationPacket<'a> {
+    fn write(pkt: &mut Pkt, cid: u32, seq: u8, data: &[u8]) {
+        pkt[0..4].copy_from_slice(cid.to_be_bytes().as_slice());
+        pkt[4] = seq;
+        pkt[5..5 + data.len()].copy_from_slice(data);
+    }
+    fn cid(&self) -> u32 {
+        InitializationPacket(&self.0).cid()
+    }
+    fn seq(&self) -> (bool, u8) {
+        InitializationPacket(&self.0).cmd()
+    }
+    fn data(&self, bcnt: usize) -> &[u8] {
+        &self.0[5..min(5 + bcnt, PACKET_SIZE)]
+    }
+}
+
+impl From<Box<URB>> for Pkt {
+    fn from(urb: Box<URB>) -> Self {
+        match urb.complete(None) {
+            Ok(Some(buffer)) => buffer[..].try_into().unwrap(),
+            Ok(None) => panic!("no transfer buffer in input urb"),
+            Err(_) => todo!(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct Message {
+    cid: u32,
+    cmd: u8,
+    data: Vec<u8>,
+}
+
+impl Message {
+    fn new(cid: u32, cmd: u8, data: Vec<u8>) -> Message {
+        Message { cid, cmd, data }
+    }
+    fn packetize(self) -> Packetizer {
+        Packetizer { msg: self, seq: 0 }
+    }
+}
+
+struct Packetizer {
+    msg: Message,
+    seq: usize,
+}
+
+impl Iterator for Packetizer {
+    type Item = Pkt;
+    fn next(&mut self) -> Option<Self::Item> {
+        let (seq, msg) = (self.seq, &self.msg);
+        let (data, len) = (&msg.data, msg.data.len());
+        match seq {
+            0 => {
+                let mut pkt = [0u8; PACKET_SIZE];
+                let bcnt = u16::try_from(len).unwrap();
+                let data = &data[..min(INIT_SIZE, len)];
+                let w = InitializationPacket::write;
+                w(&mut pkt, msg.cid, msg.cmd, bcnt, data);
+                self.seq = 1;
+                Some(pkt)
+            }
+            _ => match INIT_SIZE + CONT_SIZE * (seq - 1) {
+                pos if len <= pos => None,
+                pos => {
+                    self.seq = seq + 1;
+                    let mut pkt = [0u8; PACKET_SIZE];
+                    let data = &data[pos..min(pos + PACKET_SIZE - 5, len)];
+                    let w = ContinuationPacket::write;
+                    assert!(seq <= 0x80);
+                    w(&mut pkt, msg.cid, (seq - 1) as u8, data);
+                    Some(pkt)
+                }
+            },
+        }
+    }
+}
+
+struct Assembler {
+    input: Box<dyn Iterator<Item = Pkt>>,
+    state: Option<Box<dyn FnOnce(&mut Assembler) -> Option<AR>>>,
+}
+
+type AR = Result<Message, AssemblerError>;
+
+#[derive(Debug)]
+enum AssemblerError {
+    //SpuriousContinuationPacket,
+    //InvalidSeq(u32),
+    ChannelBusy(u32),
+    //Timeout(u32),
+    EndOfInput,
+}
+
+impl Assembler {
+    fn new(input: Box<dyn Iterator<Item = Pkt>>) -> Self {
+        Self { input, state: None }
+    }
+    fn assemble(&mut self) -> Option<AR> {
+        match self.input.next() {
+            Some(pkt) => self.assemble_init(pkt),
+            _ => return None,
+        }
+    }
+    fn assemble_init(&mut self, pkt: Pkt) -> Option<AR> {
+        let p = InitializationPacket(&pkt);
+        let cid = p.cid();
+        let cmd = match p.cmd() {
+            (false, cmd) => cmd,
+            (true, _) => {
+                // ignore spurious continuation packet
+                eprintln!("ignoring spurious continuation packet");
+                return self.assemble();
+            }
+        };
+        let (bcnt, data) = p.data();
+        let msg = Message::new(cid, cmd, data.to_vec());
+        if bcnt == msg.data.len() {
+            return Some(Ok(msg));
+        }
+        let deadline = Instant::now() + Duration::from_millis(50);
+        self.assemble_cont(bcnt - INIT_SIZE, 0, msg, deadline)
+    }
+    fn assemble_cont(
+        &mut self,
+        mut bcnt: usize,
+        mut seq: u8,
+        mut msg: Message,
+        deadline: Instant,
+    ) -> Option<AR> {
+        loop {
+            let pkt: Pkt = self.input.next().unwrap();
+            if Instant::now() > deadline {
+                self.state = Some(Box::new(move |s| s.assemble_init(pkt)));
+                todo!() //ERR_MSG_TIMEOUT
+            }
+            let p = ContinuationPacket(&pkt);
+            if p.cid() != msg.cid {
+                self.state = Some(Box::new(move |s| {
+                    s.assemble_cont(bcnt, seq, msg, deadline)
+                }));
+                return Some(Err(AssemblerError::ChannelBusy(p.cid())));
+            }
+            match p.seq() {
+                (false, _) => todo!(), //ERR_INVALID_SEQ; Handle CANCEL?
+                (true, pseq) if pseq != seq => todo!(), //ERR_INVALID_SEQ
+                _ => (),
+            }
+            msg.data.extend_from_slice(p.data(bcnt));
+            if bcnt <= CONT_SIZE {
+                return Some(Ok(msg));
+            }
+            seq += 1;
+            bcnt -= CONT_SIZE;
+        }
+    }
+}
+
+struct URBReceiver(Receiver<Box<URB>>);
+impl Iterator for URBReceiver {
+    type Item = Pkt;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.0.recv() {
+            Ok(urb) => Some(Pkt::from(urb)),
+            Err(RecvError) => None,
+        }
+    }
+}
+
+impl Iterator for Assembler {
+    type Item = AR;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.state.take() {
+            None => self.assemble(),
+            Some(f) => f(self),
         }
     }
 }
@@ -344,285 +554,293 @@ fn output_loop(
 impl Parser {
     pub fn new(
         token: Token,
-        prompt: Box<dyn Prompt>,
+        prompt: Prompt,
     ) -> (Sender<Box<URB>>, Sender<Box<URB>>) {
-        let (in_port, input) = std::sync::mpsc::channel();
-        let (out_port, output) = std::sync::mpsc::channel();
-        let (queue_port, queue) = std::sync::mpsc::channel();
-        let mut s = Self {
-            channels: vec![],
-            token,
-            prompt: Arc::new(Mutex::new(prompt)),
-            input,
-            queue_port,
-        };
-        thread::spawn(move || loop {
-            log!("start input loop");
-            loop {
-                s.input().unwrap()
+        let (input, asm_rx) = mpsc::channel();
+        let (parser_tx, parser_rx) = mpsc::channel();
+        let (queue_tx, queue_rx) = mpsc::channel();
+        let (output, output_rx) = mpsc::channel();
+        let parser_tx2 = parser_tx.clone();
+        thread::spawn(move || {
+            let assembler = Assembler::new(Box::new(URBReceiver(asm_rx)));
+            use ParserInput::Asm;
+            for r in assembler {
+                if parser_tx2.send(Asm(r)).is_err() {
+                    return ();
+                }
             }
+            parser_tx2.send(Asm(Err(AssemblerError::EndOfInput))).ok();
         });
-        thread::spawn(move || output_loop(output, queue).unwrap());
-        (in_port, out_port)
+        thread::spawn(move || {
+            let mut s = Self {
+                input_rx: parser_rx,
+                input_tx: parser_tx,
+                queue_port: queue_tx,
+                token,
+                prompt: prompt,
+                cid_counter: 0,
+                tag_counter: 0,
+            };
+            s.input_loop()
+        });
+        thread::spawn(move || output_loop(output_rx, queue_rx));
+        (input, output)
     }
-
-    fn input(&mut self) -> R<()> {
-        let urb = self.input.recv()?;
-        log!("input urb: {}", urb.transfer_buffer.len());
-        let pkt = &urb.transfer_buffer;
-        assert!(pkt.len() >= 7);
-        let cid = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
-        const ALLOC_CHANNEL: u8 = CTAPHID_INIT | (1 << 7);
-        match (cid, pkt[4]) {
-            (CTAPHID_BROADCAST_CID, ALLOC_CHANNEL) => {
-                self.init_cmd(cid, pkt)?
+    fn input_loop(&mut self) {
+        log!("start input loop");
+        loop {
+            use AssemblerError::*;
+            use ParserInput::*;
+            match self.input_rx.recv() {
+                Ok(Asm(Ok(msg))) => self.dispatch_message(msg),
+                Err(RecvError) => break,
+                Ok(Asm(Err(ChannelBusy(cid)))) => {
+                    self.send_error(cid, ERR_BUSY)
+                }
+                Ok(c @ Consent(..)) => {
+                    log!("ignoring belated consent: {:?}", c)
+                }
+                Ok(Status(..)) => todo!(), //ignore canceled transcations
+                Ok(x) => {
+                    dbg!(x);
+                    todo!()
+                }
             }
-            (CTAPHID_BROADCAST_CID, _) => {
-                panic!("Invalid command for broadcast cid")
-            }
-            (cid, _) => self.channels[cid as usize - 1].parse(pkt)?,
         }
-        Ok(urb.complete(0))
+        log!("input loop finished");
     }
-
-    fn init_cmd(&mut self, cid: u32, pkt: &[u8]) -> R<()> {
-        log!("init_cmd");
-        let bcnt = u16::from_be_bytes([pkt[5], pkt[6]]);
-        let data = &pkt[7..min(pkt.len(), 7 + (bcnt as usize))];
-        assert!(data.len() == 8);
-        let nonce = u64::from_le_bytes([
-            data[0], data[1], data[2], data[3], data[4], data[5], data[6],
-            data[7],
-        ]);
+    fn dispatch_message(&mut self, msg: Message) {
+        let Message { cid, cmd, data } = msg;
+        if !self.is_valid_channel_id(cid) {
+            dbg!(cid);
+            dbg!(cid.to_be_bytes());
+            todo!()
+        }
+        match cmd {
+            CTAPHID_INIT => match (cid, data.len()) {
+                (CTAPHID_BROADCAST_CID, 8) => {
+                    self.allocate_channel(&data.try_into().unwrap())
+                }
+                (_, 8) => todo!(),
+                _ => todo!(),
+            },
+            CTAPHID_PING => self.ping_cmd(cid, data),
+            CTAPHID_CBOR => self.cbor_cmd(cid, data),
+            CTAPHID_MSG => self.msg_cmd(cid, data),
+            CTAPHID_CANCEL => (),
+            _ => todo!(),
+        }
+    }
+    fn is_valid_channel_id(&self, cid: u32) -> bool {
         match cid {
-            CTAPHID_BROADCAST_CID => self.allocate_channel(nonce, pkt),
-            _ => panic!("init_channel nyi: {}", cid),
+            CTAPHID_BROADCAST_CID => true,
+            0 => false,
+            _ => cid <= self.cid_counter,
         }
     }
-
-    fn allocate_channel(&mut self, nonce: u64, pkt: &[u8]) -> R<()> {
-        let cid = (self.channels.len() + 1) as u32;
-        let channel = Channel {
-            cid: cid,
-            state: State::Init,
-            token: self.token.clone(),
-            prompt: self.prompt.clone(),
-            queue_port: self.queue_port.clone(),
-        };
-        self.channels.push(channel);
+    fn allocate_channel(&mut self, nonce: &[u8; 8]) {
+        let cid = self.cid_counter + 1;
+        self.cid_counter = cid;
+        log!("allocate channel: {}", cid);
         let response = InitResponse {
-            channel: CTAPHID_BROADCAST_CID,
-            cmd: CTAPHID_INIT | (1 << 7),
-            bcnt: 17,
-            nonce: nonce.to_le_bytes(),
+            nonce: nonce.clone(),
             channelid: cid,
-            protocol_version: 2,
+            protocol_version: PROTOCOL_VERSION,
             device_major_version: 0,
             device_minor_version: 0,
             device_build_version: 0,
-            capabilities: CAPABILITY_CBOR & !CAPABILITY_NMSG,
+            capabilities: CAPABILITY_CBOR,
+        }
+        .pack()
+        .unwrap()
+        .to_vec();
+        self.send_reply(CTAPHID_BROADCAST_CID, CTAPHID_INIT, response)
+    }
+    fn send_reply(&self, cid: u32, cmd: u8, data: Vec<u8>) {
+        let queue = &self.queue_port;
+        let msg = Message::new(cid, cmd, data);
+        log!("msg={:0X?}", msg);
+        for pkt in msg.packetize() {
+            queue.send(pkt).unwrap();
+        }
+    }
+    fn send_error(&self, cid: u32, code: u8) {
+        eprintln!("send_error");
+        self.send_reply(cid, CTAPHID_ERROR, vec![code])
+    }
+    fn ping_cmd(&mut self, cid: u32, data: Vec<u8>) {
+        self.send_reply(cid, CTAPHID_PING, data)
+    }
+    fn monitor_request(
+        &mut self,
+        cid: u32,
+        cmd: u8,
+        data: Vec<u8>,
+        fun: fn(Vec<u8>, TPort, Token),
+    ) {
+        eprintln!("monitor_request");
+        let token = self.token.clone();
+        let tx = self.input_tx.clone();
+        let tag = self.tag_counter;
+        self.tag_counter = tag + 1;
+        let handle = thread::spawn(move || fun(data, TPort(tx), token));
+        type Status = Option<Sender<Result<bool, ()>>>;
+        let mut status = None;
+        let change_status = |s: &mut Status, new: Status| {
+            if fun == CTAP2::process_request {
+                let code = match s {
+                    None => STATUS_PROCESSING,
+                    Some(_) => STATUS_UPNEEDED,
+                };
+                log!("sending CTAPHID_KEEPALIVE");
+                self.send_reply(cid, CTAPHID_KEEPALIVE, vec![code]);
+            }
+            *s = new;
         };
-        self.queue_port.send(response.pack()?.to_vec())?;
-        Ok(())
+        loop {
+            use ParserInput::*;
+            use TransactionStatus::*;
+            match self.input_rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(Status(Done(response))) => {
+                    assert!(status.is_none());
+                    handle.join().unwrap();
+                    break self.send_reply(cid, cmd, response);
+                }
+                Ok(Status(ConsentNeeded(prompt, tx))) => {
+                    assert!(status.is_none());
+                    change_status(&mut status, Some(tx));
+                    self.yes_or_no_p(prompt, tag)
+                }
+                Ok(Consent(answer, t)) => match &status {
+                    _ if t != tag => {
+                        log!("ignoring belated consent");
+                        todo!()
+                    }
+                    Some(tx) if t == tag => {
+                        tx.send(Ok(answer)).unwrap();
+                        change_status(&mut status, None);
+                    }
+                    _ => todo!(),
+                },
+                Err(RecvTimeoutError::Timeout) => {
+                    eprintln!("timeout");
+                    let s = status.clone();
+                    change_status(&mut status, s);
+                }
+                Ok(Asm(Ok(msg))) => match (msg.cmd, &status) {
+                    _ if msg.cid != cid => {
+                        log!("busy tag={} cid={}", tag, cid);
+                        self.send_error(msg.cid, ERR_BUSY)
+                    }
+                    (CTAPHID_CANCEL, Some(tx)) => {
+                        log!("cancelling tag={} cid={}", tag, cid);
+                        tx.send(Err(())).unwrap();
+                        change_status(&mut status, None);
+                    }
+                    (CTAPHID_CANCEL, None) => {
+                        log!("can't cancel while processing");
+                    }
+                    _ => todo!(),
+                },
+                msg => {
+                    dbg!(Some(msg));
+                    todo!()
+                }
+            }
+        }
+    }
+    fn yes_or_no_p(&self, query: String, tag: Tag) {
+        let prompt = self.prompt.clone();
+        let tx = self.input_tx.clone();
+        thread::spawn(move || {
+            let r = prompt(&query);
+            match r {
+                Ok(x) => tx.send(ParserInput::Consent(x, tag)).unwrap(),
+                Err(e) => {
+                    log!("yes_or_no_p failed: {:?}", e);
+                    tx.send(ParserInput::Consent(false, tag)).unwrap()
+                }
+            }
+        });
+    }
+    fn cbor_cmd(&mut self, cid: u32, data: Vec<u8>) {
+        eprintln!("cbor_cmd");
+        let fun = CTAP2::process_request;
+        self.monitor_request(cid, CTAPHID_CBOR, data, fun)
+    }
+    fn msg_cmd(&mut self, cid: u32, data: Vec<u8>) {
+        let fun = U2F::process_request;
+        self.monitor_request(cid, CTAPHID_MSG, data, fun)
     }
 }
 
-impl Channel {
-    fn parse(&mut self, pkt: &[u8]) -> R<()> {
-        use State::*;
-        match &self.state {
-            Init => self.init_state(pkt),
-            Cont { .. } => self.cont_state(pkt),
-            MakeCredential { .. } => self.make_credential_state(pkt),
-            GetAssertion { .. } => self.get_assertion_state(pkt),
-            //s => panic!("nyi: {:?}", s),
+struct TPort(Sender<ParserInput>);
+impl TPort {
+    // The error result indicates a CTAPHID_CANCEL
+    fn get_consent(&self, s: String) -> Result<bool, ()> {
+        let (tx, rx) = mpsc::channel();
+        self.send(TransactionStatus::ConsentNeeded(s, tx));
+        rx.recv().unwrap_or(Ok(false))
+    }
+    fn send(&self, msg: TransactionStatus) {
+        self.0.send(ParserInput::Status(msg)).unwrap();
+    }
+}
+
+struct CTAP2 {
+    port: TPort,
+    token: Token,
+}
+
+type C2R = Result<Vec<u8>, u8>;
+
+impl CTAP2 {
+    fn process_request(req: Vec<u8>, port: TPort, token: Token) {
+        let (cmd, cbor) = (req[0], &req[1..]);
+        log!("ctap2::process_request cmd: {:?}", cmd);
+        let s = CTAP2 { port, token };
+        let r = match cmd {
+            CTAP2_GET_INFO => s.get_info(cbor),
+            CTAP2_MAKE_CREDENTIAL => s.make_credential(cbor),
+            CTAP2_GET_ASSERTION => s.get_assertion(cbor),
+            _ => todo!(),
         }
+        .map_or_else(
+            |code| vec![code],
+            |mut data| {
+                data.insert(0, CTAP1_ERR_SUCCESS);
+                data
+            },
+        );
+        s.port.send(TransactionStatus::Done(r))
     }
-
-    // FIXME: return None in case of error
-    fn parse_packet(pkt: &[u8]) -> (u32, u8, u16, &[u8]) {
-        assert!(pkt.len() >= 7);
-        let cid = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
-        let cmd = pkt[4];
-        assert!((cmd >> 7) == 1);
-        let cmd = cmd & !(1 << 7);
-        let bcnt = u16::from_be_bytes([pkt[5], pkt[6]]);
-        let data = &pkt[7..min(pkt.len(), 7 + (bcnt as usize))];
-        (cid, cmd, bcnt, data)
-    }
-
-    fn init_state(&mut self, pkt: &[u8]) -> R<()> {
-        assert!(pkt.len() >= 8);
-        let cid = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
-        assert!(cid == self.cid);
-        let cmd = pkt[4];
-        assert!((cmd >> 7) == 1);
-        let cmd = cmd & !(1 << 7);
-        let bcnt = u16::from_be_bytes([pkt[5], pkt[6]]);
-        let data = &pkt[7..min(pkt.len(), 7 + (bcnt as usize))];
-        if data.len() == bcnt as usize {
-            self.process_message(cmd, data)
-        } else {
-            log!(
-                "init_cont: cid: {:x} bcnt: {} cmd: {}",
-                self.cid,
-                bcnt,
-                cmd
-            );
-            self.state = State::Cont {
-                cmd: cmd,
-                bcnt: bcnt,
-                seqnum: 0,
-                buffer: data.to_vec(),
-            };
-            Ok(())
-        }
-    }
-
-    fn cont_state(&mut self, pkt: &[u8]) -> R<()> {
-        if let State::Cont {
-            seqnum,
-            buffer,
-            bcnt,
-            cmd,
-        } = &mut self.state
-        {
-            assert!(pkt.len() > 5);
-            let cid = u32::from_le_bytes([pkt[0], pkt[1], pkt[2], pkt[3]]);
-            assert!(cid == self.cid);
-            let lseqnum = pkt[4];
-            assert!((lseqnum >> 7) == 0);
-            assert!(lseqnum == *seqnum);
-            let m = MAX_PACKET_SIZE;
-            assert!(
-                buffer.len()
-                    == (m - 7 + lseqnum as u16 * (m - 5)) as usize
-            );
-            if m - 7 + (lseqnum + 1) as u16 * (m - 5) < *bcnt {
-                *seqnum = lseqnum + 1;
-                buffer.extend(&pkt[5..]);
-                Ok(())
-            } else {
-                let rest = *bcnt as usize - buffer.len();
-                buffer.extend(&pkt[5..5 + rest as usize]);
-                assert!(buffer.len() == *bcnt as usize);
-                let cmd = *cmd;
-                let data = buffer.clone();
-                self.state = State::Init;
-                self.process_message(cmd, &data)
-            }
-        } else {
-            panic!()
-        }
-    }
-
-    fn process_message(&mut self, cmd: u8, data: &[u8]) -> R<()> {
-        log!("process_message: 0x{:x}", cmd);
-        match cmd {
-            //CTAPHID_INIT => self.init_cmd (data),
-            CTAPHID_PING => self.ping_cmd(data),
-            CTAPHID_CBOR => self.cbor_cmd(data),
-            CTAPHID_MSG => self.msg_cmd(data),
-            CTAPHID_CANCEL => Ok(()), // Ignored, as per spec.
-            _ => {
-                let _ = self.send_error(ERR_INVALID_CMD);
-                panic!("Command nyi: {}", cmd)
-            }
-        }
-    }
-
-    fn ping_cmd(&mut self, data: &[u8]) -> R<()> {
-        log!("ping_cmd data: {}", String::from_utf8_lossy(&data));
-        self.send_reply(CTAPHID_PING, data)
-    }
-
-    fn send_reply(&self, cmd: u8, data: &[u8]) -> R<()> {
-        let queue = &self.queue_port;
-        let cid = self.cid;
-        let mut reply = u32::to_le_bytes(cid).to_vec();
-        reply.push(cmd | (1 << 7));
-        reply.extend_from_slice(&u16::to_be_bytes(data.len() as u16));
-        let init_max = MAX_PACKET_SIZE as usize - 7;
-        if data.len() < init_max {
-            reply.extend_from_slice(data);
-            queue.send(reply)?;
-        } else {
-            reply.extend_from_slice(&data[0..init_max]);
-            queue.send(reply)?;
-            let cont_max = MAX_PACKET_SIZE as usize - 5;
-            data[init_max..].chunks(cont_max).enumerate().try_for_each(
-                |(i, chunk)| {
-                    let mut cont = u32::to_le_bytes(cid).to_vec();
-                    assert!(i < 0x7f);
-                    cont.push(i as u8);
-                    cont.extend_from_slice(chunk);
-                    queue.send(cont)
-                },
-            )?
-        }
-        Ok(())
-    }
-
-    fn cbor_cmd(&mut self, data: &[u8]) -> R<()> {
-        assert!(data.len() >= 1);
-        let cmd = data[0];
-        let cbor = &data[1..];
-        log!("cbor_cmd cmd: {:?}", cmd);
-        match cmd {
-            CTAP2_GET_INFO => self.get_info(cbor),
-            CTAP2_MAKE_CREDENTIAL => self.make_credential(cbor),
-            CTAP2_GET_ASSERTION => self.get_assertion(cbor),
-            _ => panic!("ctap2 command {} nyi", cmd),
-        }
-    }
-
-    fn send_error(&mut self, data: u8) -> R<()> {
-        log!("send_error: {}", data);
-        self.send_reply(CTAPHID_ERROR, &[data])
-    }
-
-    fn get_info(&mut self, cbor: &[u8]) -> R<()> {
+    fn get_info(&self, cbor: &[u8]) -> C2R {
         log!("get_info");
         assert!(cbor.len() == 0);
         let reply = GetInfoResponse {
-            _marker: None,
+            _padding: None,
             versions: vec!["FIDO_2_0".to_owned(), "U2F_V2".to_owned()],
             aaguid: Bytes(AAGUID.to_le_bytes().to_vec()),
-            extensions: None,
+            //extensions: None,
+            extensions: Some(vec![]),
         };
-        let cbor = serde_cbor::ser::to_vec_packed(&reply)?;
-        return self.send_cbor_reply(&cbor);
+        Ok(serde_cbor::ser::to_vec_packed(&reply).unwrap())
     }
-
-    fn send_cbor_reply(&mut self, cbor: &[u8]) -> R<()> {
-        let status = CTAP1_ERR_SUCCESS;
-        let mut data = vec![status];
-        data.extend_from_slice(cbor);
-        self.send_reply(CTAPHID_CBOR, &data)
-    }
-
-    fn send_cbor_error(&mut self, error: u8) -> R<()> {
-        self.send_reply(CTAPHID_CBOR, &[error])
-    }
-
-    fn make_credential(&mut self, cbor: &[u8]) -> R<()> {
-        let args = match serde_cbor::from_slice::<MakeCredentialArgs>(cbor)
-        {
+    fn make_credential(&self, cbor: &[u8]) -> C2R {
+        let args: MakeCredentialArgs = match serde_cbor::from_slice(cbor) {
             Ok(args) => args,
-            Err(err) => {
-                log!("can't parse make_credential args: {}", err);
-                return self.send_cbor_error(ERR_INVALID_CBOR);
+            Err(e) => {
+                dbg!(e);
+                return Err(ERR_INVALID_CBOR);
             }
         };
         log!("CTAP2_MAKE_CREDENTIAL {}", args.rp.id);
-        assert!(args.user.id.0.len() <= 64);
-        match &args.pub_key_algs[0] {
-            PublicKeyCredentialParameters { alg: -7, r#type: t }
-                if t == "public-key" =>
-            {
-                ()
-            }
-            x => panic!("crypto alg not supported: {:?}", x),
+        if !args.user.id.0.len() <= 64 {
+            todo!();
+        }
+        let algs = args.pub_key_algs;
+        if !algs.iter().any(|a| a.alg == -7 && a.r#type == "public-key") {
+            todo!()
         };
         let prompt = format!(
             "Consent needed for creating registration credentials
@@ -636,68 +854,15 @@ Allow? ",
             &args.user.name,
             &args.user.display_name
         );
-        let x = self.prompt.lock().unwrap().yes_or_no_p(&prompt);
-        self.state = State::MakeCredential {
-            args: args,
-            consent: x,
-        };
-        self.make_credential_2()
-    }
-
-    fn make_credential_2(&mut self) -> R<()> {
-        let consent = match &self.state {
-            State::MakeCredential { consent, .. } => consent,
-            _ => panic!(),
-        };
-        let r = match consent.recv_timeout(Duration::from_millis(200)) {
-            Ok(Ok(true)) => self.make_credential_3(),
-            Ok(Ok(false)) | Err(RecvTimeoutError::Disconnected) => {
-                self.send_cbor_error(ERR_OPERATION_DENIED)
+        match self.port.get_consent(prompt) {
+            Ok(false) => return Err(ERR_OPERATION_DENIED),
+            Err(()) => {
+                log!("ERR_KEEPALIVE_CANCEL");
+                return Err(ERR_KEEPALIVE_CANCEL);
             }
-            Ok(Err(e)) => panic!("Receive consent: {:?}", e),
-            Err(RecvTimeoutError::Timeout) => {
-                return self
-                    .send_reply(CTAPHID_KEEPALIVE, &[STATUS_UPNEEDED][..])
-            }
-        };
-        self.state = State::Init;
-        r
-    }
-
-    fn build_auth_data(
-        &self,
-        rp_id: &[u8],
-        wrapped_priv_key: &[u8],
-        pub_key_cose: &[u8],
-    ) -> R<Vec<u8>> {
-        let counter: u32 = self.token.increment_token_counter()?;
-        let flags: u8 = 1 << 0 | 1 << 6;
-        let credential_id =
-            serde_cbor::ser::to_vec_packed(&CredentialId {
-                wrapped_private_key: Bytes(wrapped_priv_key.to_vec()),
-                encrypted_rp_id: Bytes(self.token.encrypt(&rp_id)?),
-            })?;
-        Ok([
-            &self.token.sha256_hash(rp_id)?[..],
-            &[flags],
-            &counter.to_be_bytes(),
-            &AAGUID.to_le_bytes(),
-            &(credential_id.len() as u16).to_be_bytes(),
-            &credential_id,
-            pub_key_cose,
-        ]
-        .concat())
-    }
-
-    fn make_credential_3(&mut self) -> R<()> {
-        let (privk, pubk) = self
-            .token
-            .generate_key_pair()
-            .unwrap_or_else(|e| panic!("generate_key_pair failed: {}", e));
-        let args = match &self.state {
-            State::MakeCredential { args, .. } => args,
-            _ => panic!(),
-        };
+            Ok(true) => (),
+        }
+        let (privk, pubk) = self.token.generate_key_pair().unwrap();
         assert!(!args.options.rk);
         let pub_key_cose = serde_cbor::ser::to_vec_packed(&CoseKey {
             kty: 2,
@@ -705,249 +870,241 @@ Allow? ",
             crv: 1,
             x: Bytes(pubk.0),
             y: Bytes(pubk.1),
-        })?;
+        })
+        .unwrap();
         let auth_data = self.build_auth_data(
             args.rp.id.as_bytes(),
             &privk,
             &pub_key_cose,
-        )?;
+        );
         let att_obj = MakeCredentialResponse {
-            _marker: None,
+            _padding: None,
             fmt: "none".to_string(),
             auth_data: Bytes(auth_data),
             att_stmt: std::collections::BTreeMap::new(),
         };
-        let cbor = serde_cbor::ser::to_vec_packed(&att_obj)?;
-        self.send_cbor_reply(&cbor)
+        Ok(serde_cbor::ser::to_vec_packed(&att_obj).unwrap())
     }
 
-    fn make_credential_state(&mut self, pkt: &[u8]) -> R<()> {
-        log!("make_credential_state");
-        match Self::parse_packet(pkt) {
-            (_, HACK_CHECK_STATUS, 0, _) => self.make_credential_2(),
-            (_, CTAPHID_CANCEL, 0, _) => self.make_credential_cancel(),
-            (_cid, cmd, bcnt, data) => panic!(
-                "unexpected pkg: cmd: {:x} bcnt: {} data: {:?}",
-                cmd, bcnt, data
-            ),
-        }
+    fn build_auth_data(
+        &self,
+        rp_id: &[u8],
+        wrapped_priv_key: &[u8],
+        pub_key_cose: &[u8],
+    ) -> Vec<u8> {
+        let counter: u32 = self.token.increment_token_counter().unwrap();
+        let flags: u8 = 1 << 0 | 1 << 6;
+        let credential_id =
+            serde_cbor::ser::to_vec_packed(&CredentialId {
+                wrapped_private_key: Bytes(wrapped_priv_key.to_vec()),
+                encrypted_rp_id: Bytes(
+                    self.token.encrypt(&rp_id).unwrap(),
+                ),
+            })
+            .unwrap();
+        [
+            &self.token.sha256_hash(rp_id).unwrap()[..],
+            &[flags],
+            &counter.to_be_bytes(),
+            &AAGUID.to_le_bytes(),
+            &(credential_id.len() as u16).to_be_bytes(),
+            &credential_id,
+            pub_key_cose,
+        ]
+        .concat()
     }
 
-    fn make_credential_cancel(&mut self) -> R<()> {
-        self.state = State::Init;
-        self.send_cbor_error(ERR_KEEPALIVE_CANCEL)
-    }
-
-    fn get_assertion(&mut self, cbor: &[u8]) -> R<()> {
+    fn get_assertion(&self, cbor: &[u8]) -> C2R {
         let args: GetAssertionArgs = match serde_cbor::from_slice(cbor) {
             Ok(x) => x,
             Err(e) => {
                 log!("failed to parse cbor: {}", e);
-                return self.send_error(ERR_INVALID_PAR);
+                todo!() //return Err(ERR_INVALID_PAR);
             }
         };
         log!("get_assertion {:?}", args);
-        assert!(args.allow_list.len() == 1);
+        if args.allow_list.len() != 1 {
+            todo!()
+        }
         let credential_id: CredentialId =
             match serde_cbor::from_slice(&args.allow_list[0].id.0) {
                 Ok(x) => x,
-                Err(_) => {
-                    return self.send_cbor_error(ERR_INVALID_CREDENTIAL)
-                }
+                Err(_) => return Err(ERR_INVALID_CREDENTIAL),
             };
         match (
             self.token.decrypt(&credential_id.encrypted_rp_id.0),
             args.rp_id.as_bytes(),
         ) {
             (Ok(id1), id2) if id1 == id2 => (),
-            _ => return self.send_cbor_error(ERR_INVALID_CREDENTIAL),
+            _ => return Err(ERR_INVALID_CREDENTIAL),
         };
         let prompt = format!(
-            "Consent needed for signing challange
+            "Consent needed for signing challenge
 
   Relying Party: {}
 
 Allow?",
             &args.rp_id
         );
-        let x = self.prompt.lock().unwrap().yes_or_no_p(&prompt);
-        self.state = State::GetAssertion {
-            args: args,
-            consent: x,
-        };
-        self.get_assertion_2()
-    }
-
-    // FIXME: almost the same as make_credential_2
-    fn get_assertion_2(&mut self) -> R<()> {
-        let consent = match &self.state {
-            State::GetAssertion { consent, .. } => consent,
-            _ => panic!(),
-        };
-        let r = match consent.recv_timeout(Duration::from_millis(200)) {
-            Ok(Ok(true)) => self.get_assertion_3(),
-            Ok(Ok(false)) | Err(RecvTimeoutError::Disconnected) => {
-                self.send_cbor_error(ERR_OPERATION_DENIED)
-            }
-            Ok(Err(e)) => panic!("Receive consent: {:?}", e),
-            Err(RecvTimeoutError::Timeout) => {
-                return self
-                    .send_reply(CTAPHID_KEEPALIVE, &[STATUS_UPNEEDED][..])
-            }
-        };
-        self.state = State::Init;
-        r
-    }
-
-    fn get_assertion_3(&mut self) -> R<()> {
-        let args = match &self.state {
-            State::GetAssertion { args, .. } => args,
-            _ => panic!(),
-        };
+        match self.port.get_consent(prompt) {
+            Ok(false) => return Err(ERR_OPERATION_DENIED),
+            Err(()) => return Err(ERR_KEEPALIVE_CANCEL),
+            Ok(true) => (),
+        }
         let credential_id = serde_cbor::from_slice::<CredentialId>(
             &args.allow_list[0].id.0,
         )
         .unwrap();
         let wpriv_key = &credential_id.wrapped_private_key.0;
-        let counter = self.token.increment_token_counter()?;
+        let counter = self.token.increment_token_counter().unwrap();
         let auth_data: Vec<u8> = [
-            &self.token.sha256_hash(args.rp_id.as_bytes())?[..],
-            &vec![
-                1<<0|  // User Present (UP) result
-                  0<<6,
-            ], // Attested credential data included (AT).
+            &self.token.sha256_hash(args.rp_id.as_bytes()).unwrap()[..],
+            &[
+                1<<0| // User Present (UP) result
+                0<<6, // Attested credential data included (AT).
+            ],
             &counter.to_be_bytes(),
         ]
         .concat();
         let data = [&auth_data[..], &args.client_data_hash.0].concat();
-        let signature = self.token.sign(wpriv_key, &data)?;
+        let signature = self.token.sign(wpriv_key, &data).unwrap();
         let response = GetAssertionResponse {
-            _marker: None,
+            _padding: None,
             auth_data: Bytes(auth_data),
             signature: Bytes(signature),
-            credential: None,
+            credential: Some(args.allow_list[0].clone()),
             number_of_credentials: Some(1),
             user: None,
         };
-        let cbor = serde_cbor::ser::to_vec_packed(&response)?;
-        self.send_cbor_reply(&cbor)
+        Ok(serde_cbor::ser::to_vec_packed(&response).unwrap())
+        //Ok(serde_cbor::ser::to_vec(&response).unwrap())
     }
+}
 
-    fn get_assertion_state(&mut self, pkt: &[u8]) -> R<()> {
-        log!("get_assertion_state");
-        match Self::parse_packet(pkt) {
-            (_, HACK_CHECK_STATUS, 0, _) => self.get_assertion_2(),
-            (_, CTAPHID_CANCEL, 0, _) => self.get_assertion_cancel(),
-            (_cid, cmd, bcnt, data) => panic!(
-                "unexpected pkg: cmd: {:x} bcnt: {} data: {:?}",
-                cmd, bcnt, data
-            ),
-        }
-    }
+struct U2F {
+    port: TPort,
+    token: Token,
+}
 
-    fn get_assertion_cancel(&mut self) -> R<()> {
-        self.make_credential_cancel() // does the same
-    }
+type U2R = Result<Vec<u8>, u16>;
 
-    fn msg_cmd(&mut self, data: &[u8]) -> R<()> {
-        log!("msg_cmd");
-        fn payload(data: &[u8]) -> Option<(u16, &[u8], u16)> {
-            match data[..3] {
-                [0, n2, n1] => {
-                    let nc = u16::from_be_bytes([n2, n1]);
-                    let end = 3 + nc as usize;
-                    let lc = match data[end..] {
-                        [l2, l1] => u16::from_be_bytes([l2, l1]),
-                        _ => return None,
-                    };
-                    Some((nc, &data[3..end], lc))
+fn hex(s: &[u8]) -> String {
+    s.iter().map(|byte| format!("{:02X}", byte)).collect()
+}
+
+impl U2F {
+    fn process_request(req: Vec<u8>, port: TPort, token: Token) {
+        let s = U2F { port, token };
+        fn payload(data: &[u8]) -> &[u8] {
+            // extended length encoding of request length.
+            match data {
+                [0, n2, n1, rest @ ..] => {
+                    let nc = u16::from_be_bytes([*n2, *n1]) as usize;
+                    let request_data = &rest[..nc];
+                    request_data
                 }
-                _ => None,
+                _ => &[],
             }
         }
-        match (&data[..4], payload(&data[4..])) {
-            ([0, 3, 0, 0], Some((0, _, 0))) => self.u2f_version(),
-            ([0, 1, p1, 0], Some((64, d, 0))) if [0, 3].contains(&p1) => {
-                self.u2f_register(d)
+        let result = match (&req[..4], payload(&req[4..])) {
+            ([0, 3, 0, 0], []) => s.u2f_version(),
+            ([0, 1, 0, 0], params) => s.u2f_register(params),
+            ([0, 2, p1 @ (3 | 7 | 8), 0], args) => {
+                s.u2f_authenticate(*p1, args)
             }
-            ([0, 2, p1, 0], Some((_, d, 0)))
-                if [3, 7, 8].contains(&p1) =>
-            {
-                self.u2f_authenticate(*p1, d)
+            // not spec compliant, but Chrome sends this
+            ([0, 1, 3, 0], params) => s.u2f_register(params),
+            (req, payload) => {
+                dbg!(req, payload);
+                eprintln!("req: {:x?}", req);
+                todo!()
             }
-            _ => panic!("msg_cmd nyi {:?}", data),
-        }
+        };
+        let response = match result {
+            Ok(mut v) => {
+                v.extend(SW_NO_ERROR.to_be_bytes());
+                v
+            }
+            Err(code) => code.to_be_bytes().to_vec(),
+        };
+        s.port.send(TransactionStatus::Done(response))
     }
 
-    fn u2f_version(&mut self) -> R<()> {
-        let data: Vec<u8> =
-            ["U2F_V2".as_bytes(), &SW_NO_ERROR.to_be_bytes()].concat();
-        log!("u2f_version => {:?}", &data);
-        self.send_reply(CTAPHID_MSG, &data)
+    fn u2f_version(&self) -> U2R {
+        Ok(b"U2F_V2".to_vec())
     }
 
-    fn u2f_register(&mut self, data: &[u8]) -> R<()> {
+    fn u2f_register(&self, data: &[u8]) -> U2R {
         log!("u2f_register: {:?}", &data);
         assert!(data.len() == 64);
-        let challenge = &data[0..32];
+        let challenge = &data[..32];
         let application = &data[32..];
-        let consent = self
-            .prompt
-            .lock()
-            .unwrap()
-            .yes_or_no_p("Allow U2F registeration?");
-        match consent.recv_timeout(Duration::from_millis(10000)) {
-            Ok(Ok(true)) => (),
-            Ok(Ok(false))
-            | Err(RecvTimeoutError::Disconnected)
-            | Err(RecvTimeoutError::Timeout) => {
-                return self.send_reply(
-                    CTAPHID_MSG,
-                    &SW_CONDITIONS_NOT_SATISFIED.to_be_bytes(),
-                )
-            }
-            Ok(Err(e)) => panic!("Receive consent: {:?}", e),
+        let query = format!(
+            "Allow U2F registeration?
+
+challenge: {}
+application: {}
+",
+            hex(challenge),
+            hex(application)
+        );
+        if let Ok(false) | Err(()) = self.port.get_consent(query) {
+            return Err(SW_CONDITIONS_NOT_SATISFIED);
         }
-        let (wpriv, (x, y)) = self.token.generate_key_pair()?;
+        let (wpriv, (x, y)) = self.token.generate_key_pair().unwrap();
         let pub_key = [&[4u8][..], &x, &y].concat();
         assert!(pub_key.len() == 65);
         assert!(wpriv.len() <= 255);
         let credential_id = CredentialId {
             wrapped_private_key: Bytes(wpriv.clone()),
-            encrypted_rp_id: Bytes(self.token.encrypt(&application)?),
+            encrypted_rp_id: Bytes(
+                self.token.encrypt(&application).unwrap(),
+            ),
         };
         println!("credential_id: {:?}", &credential_id);
         println!("application: {:?}", &application);
-        let key_handle = serde_cbor::ser::to_vec_packed(&credential_id)?;
-        let signature = self.token.sign(
-            &wpriv,
-            &[&[0u8][..], application, challenge, &key_handle, &pub_key]
+        let key_handle =
+            serde_cbor::ser::to_vec_packed(&credential_id).unwrap();
+        let signature = self
+            .token
+            .sign(
+                &wpriv,
+                &[
+                    &[0u8][..],
+                    application,
+                    challenge,
+                    &key_handle,
+                    &pub_key,
+                ]
                 .concat(),
-        )?;
+            )
+            .unwrap();
         let not_before = chrono::Utc::now();
         let not_after = not_before + chrono::Duration::days(30);
-        let cert = self.token.create_certificate(
-            &wpriv,
-            &pub_key,
-            "Fakecompany",
-            "Fakecompany",
-            not_before,
-            Some(not_after),
-        )?;
-        let result = [
+        let cert = self
+            .token
+            .create_certificate(
+                &wpriv,
+                &pub_key,
+                "Fakecompany",
+                "Fakecompany",
+                not_before,
+                Some(not_after),
+            )
+            .unwrap();
+        assert!(key_handle.len() <= 255);
+        Ok([
             &[5u8][..], // reserved byte 5
             &pub_key,
             &[key_handle.len() as u8],
             &key_handle,
             &cert,
             &signature,
-            &SW_NO_ERROR.to_be_bytes(),
         ]
-        .concat();
-        self.send_reply(CTAPHID_MSG, &result)
+        .concat())
     }
 
-    fn u2f_authenticate(&mut self, control: u8, data: &[u8]) -> R<()> {
+    fn u2f_authenticate(&self, control: u8, data: &[u8]) -> U2R {
         log!("u2f_authenticate: 0x{:0x} {:?}", control, &data);
         let challange = &data[..32];
         let application = &data[32..64];
@@ -957,12 +1114,7 @@ Allow?",
         let credential_id: CredentialId =
             match serde_cbor::from_slice(key_handle) {
                 Ok(x) => x,
-                _ => {
-                    return self.send_reply(
-                        CTAPHID_MSG,
-                        &SW_WRONG_DATA.to_be_bytes(),
-                    )
-                }
+                _ => return Err(SW_WRONG_DATA),
             };
         println!("credential_id = {:?}", &credential_id);
         println!("application: {:?}", &application);
@@ -970,57 +1122,260 @@ Allow?",
         assert!(self.token.is_valid_id(wpriv));
         match self.token.decrypt(&credential_id.encrypted_rp_id.0) {
             Ok(rp_id) if rp_id == application => (),
-            _ => {
-                return self
-                    .send_reply(CTAPHID_MSG, &SW_WRONG_DATA.to_be_bytes())
-            }
+            _ => return Err(SW_WRONG_DATA),
         };
         match control {
-            7 => {
-                let code = SW_CONDITIONS_NOT_SATISFIED;
-                self.send_reply(CTAPHID_MSG, &code.to_be_bytes())
-            }
+            7 => Err(SW_CONDITIONS_NOT_SATISFIED),
             3 => {
-                let consent = self
-                    .prompt
-                    .lock()
-                    .unwrap()
-                    .yes_or_no_p("Allow U2F authentication?");
-                match consent.recv_timeout(Duration::from_millis(10000)) {
-                    Ok(Ok(true)) => (),
-                    Ok(Ok(false))
-                    | Err(RecvTimeoutError::Disconnected)
-                    | Err(RecvTimeoutError::Timeout) => {
-                        return self.send_reply(
-                            CTAPHID_MSG,
-                            &SW_CONDITIONS_NOT_SATISFIED.to_be_bytes(),
-                        )
-                    }
-                    Ok(Err(e)) => panic!("Receive consent: {:?}", e),
+                let query = "Allow U2F authentication?".into();
+                if let Ok(false) | Err(()) = self.port.get_consent(query) {
+                    return Err(SW_CONDITIONS_NOT_SATISFIED);
                 }
                 let presence = 1u8;
-                let counter = self.token.increment_token_counter()?;
-                let sig = self.token.sign(
-                    wpriv,
-                    &[
-                        application,
-                        &[presence],
-                        &counter.to_be_bytes(),
-                        challange,
-                    ]
-                    .concat(),
-                )?;
-
-                let reply = [
-                    &[presence][..],
-                    &counter.to_be_bytes(),
-                    &sig,
-                    &SW_NO_ERROR.to_be_bytes(),
-                ]
-                .concat();
-                self.send_reply(CTAPHID_MSG, &reply)
+                let token = &self.token;
+                let counter = token.increment_token_counter().unwrap();
+                let sig = token
+                    .sign(
+                        wpriv,
+                        &[
+                            application,
+                            &[presence],
+                            &counter.to_be_bytes(),
+                            challange,
+                        ]
+                        .concat(),
+                    )
+                    .unwrap();
+                Ok([&[presence][..], &counter.to_be_bytes(), &sig]
+                    .concat())
             }
-            _ => panic!("control byte 0x{:0x} nyi", control),
+            _ => todo!(),
         }
+    }
+}
+
+#[cfg(test)]
+pub mod tests {
+    use super::*;
+    use crate::crypto;
+    use crate::prompt;
+
+    #[test]
+    fn initialization_packet() {
+        let data = b"abcdefg";
+        let msg = Message {
+            cid: CTAPHID_BROADCAST_CID,
+            cmd: CTAPHID_INIT,
+            data: data.to_vec(),
+        };
+        let pkts: Vec<Pkt> = msg.packetize().collect();
+        assert_eq!(pkts.len(), 1);
+        let p = InitializationPacket(&pkts[0]);
+        assert_eq!(p.cid(), CTAPHID_BROADCAST_CID);
+        assert_eq!(p.cmd(), (false, CTAPHID_INIT));
+        assert_eq!(p.data(), (7, data.as_slice()));
+    }
+
+    #[test]
+    fn packetize() {
+        for len in [0, 10, INIT_SIZE - 1, INIT_SIZE] {
+            let data: Vec<u8> = (0..len).map(|u| u as u8).collect();
+            let msg = Message::new(123, CTAPHID_PING, data.clone());
+            let pkts: Vec<Pkt> = msg.packetize().collect();
+            assert_eq!(pkts.len(), 1);
+            let p = InitializationPacket(&pkts[0]);
+            assert_eq!(p.cid(), 123);
+            assert_eq!(p.cmd(), (false, CTAPHID_PING));
+            assert_eq!(p.data(), (data.len(), &data[..]));
+        }
+        for len in [INIT_SIZE + 1, INIT_SIZE + CONT_SIZE] {
+            let data: Vec<u8> = (0..len).map(|u| u as u8).collect();
+            let msg = Message::new(123, CTAPHID_PING, data.clone());
+            let pkts: Vec<Pkt> = msg.packetize().collect();
+            assert_eq!(pkts.len(), 2);
+            let p0 = InitializationPacket(&pkts[0]);
+            assert_eq!(p0.cid(), 123);
+            assert_eq!(p0.cmd(), (false, CTAPHID_PING));
+            assert_eq!(p0.data(), (data.len(), &data[..INIT_SIZE]));
+            let p1 = ContinuationPacket(&pkts[1]);
+            assert_eq!(p1.cid(), 123);
+            assert_eq!(p1.seq(), (true, 0));
+            assert_eq!(p1.data(len - INIT_SIZE), &data[INIT_SIZE..]);
+        }
+    }
+
+    fn packet_to_urb(pkt: Pkt) -> Box<URB> {
+        Box::new(URB {
+            endpoint: 1,
+            setup: [0u8; 8],
+            complete: Some(Box::new(|u, _| Ok(u.transfer_buffer))),
+            transfer_buffer: Some(pkt.to_vec()),
+            transfer_buffer_length: pkt.len(),
+        })
+    }
+
+    #[test]
+    fn assemble() {
+        let (tx, rx) = mpsc::channel();
+        let mut assembler = Assembler::new(Box::new(rx.into_iter()));
+        for len in [
+            0,
+            10,
+            INIT_SIZE - 1,
+            INIT_SIZE,
+            INIT_SIZE + 1,
+            PACKET_SIZE,
+            INIT_SIZE + CONT_SIZE - 1,
+            INIT_SIZE + CONT_SIZE,
+            INIT_SIZE + CONT_SIZE + 1,
+            INIT_SIZE + 2 * CONT_SIZE,
+            2 * PACKET_SIZE,
+            3 * PACKET_SIZE,
+        ] {
+            let data: Vec<u8> = (0..len).map(|u| u as u8).collect();
+            let msg = Message::new(123, CTAPHID_PING, data.clone());
+            for pkt in msg.packetize() {
+                tx.send(pkt).unwrap();
+            }
+            let msg = assembler.next().unwrap().unwrap();
+            assert_eq!(msg.cid, 123);
+            assert_eq!(msg.cmd, CTAPHID_PING);
+            assert_eq!(msg.data, data);
+        }
+        std::mem::drop(tx);
+        assert!(assembler.next().is_none());
+    }
+
+    type CTAPHID = (Sender<Box<URB>>, Sender<Box<URB>>);
+    fn open_ctaphid() -> CTAPHID {
+        let token = crypto::tests::get_token().unwrap();
+        let prompt = prompt::yes_or_no_p;
+        Parser::new(token, prompt)
+    }
+
+    fn send_receive_msg(ctaphid: &CTAPHID, msg: Message) -> Message {
+        let (tx, rx) = mpsc::channel();
+        for pkt in msg.packetize() {
+            let urb = packet_to_urb(pkt);
+            ctaphid.0.send(urb).unwrap();
+            send_reply_urb(&tx, &ctaphid.1);
+        }
+        fn send_reply_urb(tx: &Sender<Box<URB>>, out: &Sender<Box<URB>>) {
+            let tx = tx.clone();
+            let urb = Box::new(URB {
+                endpoint: 1,
+                setup: [0u8; 8],
+                complete: Some(Box::new(move |_urb, buf| {
+                    let pkt: Pkt = buf.unwrap().try_into().unwrap();
+                    let urb2 = packet_to_urb(pkt);
+                    tx.send(urb2).ok();
+                    Ok(None)
+                })),
+                transfer_buffer: None,
+                transfer_buffer_length: PACKET_SIZE,
+            });
+            out.send(urb).unwrap();
+        }
+        let mut assembler = Assembler::new(Box::new(URBReceiver(rx)));
+        match assembler.next() {
+            Some(Ok(msg)) => return msg,
+            Some(Err(e)) => panic!("assembler error: {:?}", e),
+            None => panic!("assembler end of input"),
+        }
+    }
+
+    fn open_channel(ctaphid: &CTAPHID) -> u32 {
+        let nonce: Vec<u8> = (10..18).collect();
+        let m1 = Message::new(
+            CTAPHID_BROADCAST_CID,
+            CTAPHID_INIT,
+            nonce.clone(),
+        );
+        let m2 = send_receive_msg(ctaphid, m1);
+        assert_eq!(m2.cid, CTAPHID_BROADCAST_CID);
+        assert_eq!(m2.cmd, CTAPHID_INIT);
+        let r =
+            InitResponse::unpack(&m2.data.try_into().unwrap()).unwrap();
+        assert_eq!(&nonce[..], &r.nonce);
+        assert!(r.channelid != 0);
+        assert!(r.channelid != CTAPHID_BROADCAST_CID);
+        assert!(r.capabilities & CAPABILITY_CBOR != 0);
+        r.channelid
+    }
+
+    #[test]
+    fn alloc_channel() {
+        let ctaphid = open_ctaphid();
+        open_channel(&ctaphid);
+    }
+
+    #[test]
+    fn ping() {
+        let ctaphid = open_ctaphid();
+        let cid = open_channel(&ctaphid);
+        for data in [
+            &b""[..],
+            &b"abc"[..],
+            &(0..PACKET_SIZE as u8 - 7).collect::<Vec<u8>>(),
+        ] {
+            let m1 = Message::new(cid, CTAPHID_PING, data.to_vec());
+            let m2 = send_receive_msg(&ctaphid, m1);
+            assert_eq!(m2.cid, cid);
+            assert_eq!(m2.cmd, CTAPHID_PING);
+            assert_eq!(m2.data, data);
+        }
+    }
+
+    #[test]
+    fn ping_cont() {
+        let ctaphid = open_ctaphid();
+        let cid = open_channel(&ctaphid);
+        for len in [
+            INIT_SIZE,
+            INIT_SIZE + 1,
+            INIT_SIZE + CONT_SIZE,
+            PACKET_SIZE,
+            INIT_SIZE + CONT_SIZE + 1,
+            INIT_SIZE + 2 * CONT_SIZE + 1,
+            3 * PACKET_SIZE,
+            4 * PACKET_SIZE,
+        ] {
+            let data: Vec<u8> = (0..len).map(|u| u as u8).collect();
+            let m1 = Message::new(cid, CTAPHID_PING, data.clone());
+            let m2 = send_receive_msg(&ctaphid, m1);
+            assert_eq!(m2.cid, cid);
+            assert_eq!(m2.cmd, CTAPHID_PING);
+            assert_eq!(m2.data, data);
+        }
+    }
+
+    #[test]
+    fn cbor_get_info() {
+        let ctaphid = open_ctaphid();
+        let cid = open_channel(&ctaphid);
+        let data = [CTAP2_GET_INFO];
+        let m1 = Message::new(cid, CTAPHID_CBOR, data.to_vec());
+        let m2 = send_receive_msg(&ctaphid, m1);
+        assert_eq!(m2.cid, cid);
+        assert_eq!(m2.cmd, CTAPHID_CBOR);
+        assert_eq!(m2.data[0], CTAP1_ERR_SUCCESS);
+        let r: GetInfoResponse =
+            serde_cbor::from_slice(&m2.data[1..]).unwrap();
+        let Bytes(aaguid) = r.aaguid;
+        assert_eq!(aaguid, AAGUID.to_le_bytes());
+        assert!(r.versions.iter().any(|v| v == "FIDO_2_0"));
+        assert!(r.versions.iter().any(|v| v == "U2F_V2"));
+    }
+
+    #[test]
+    fn u2f_get_version() {
+        let ctaphid = open_ctaphid();
+        let cid = open_channel(&ctaphid);
+        let data = vec![0x0u8, 0x3, 0, 0, 0, 0, 0];
+        let m1 = Message::new(cid, CTAPHID_MSG, data);
+        let m2 = send_receive_msg(&ctaphid, m1);
+        assert_eq!(m2.cid, cid);
+        assert_eq!(m2.cmd, CTAPHID_MSG);
+        assert_eq!(m2.data, b"U2F_V2\x90\x00")
     }
 }

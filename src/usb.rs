@@ -6,7 +6,7 @@ use packed_struct::prelude::*;
 //use packed_struct::PackedStruct;
 use packed_struct::PrimitiveEnum;
 use std::convert::TryFrom;
-use std::io::Write;
+//use std::io::Write;
 use std::mem::size_of;
 use std::sync::mpsc::Sender;
 
@@ -171,16 +171,26 @@ pub struct Device {
 // USB Request Block
 pub struct URB {
     pub endpoint: u8,
-    pub setup: SetupPacket,
-    pub transfer_buffer: Vec<u8>,
-    pub complete: Option<Box<dyn FnOnce(Box<URB>, i32) + Send>>,
-    pub status: Option<i32>,
+    pub setup: [u8; 8],
+    pub transfer_buffer: Option<Vec<u8>>,
+    pub transfer_buffer_length: usize,
+    pub complete: Option<CompletionFn>,
+}
+type CompletionResult = Result<Option<Vec<u8>>, CompletionError>;
+type CompletionFn =
+    Box<dyn FnOnce(Box<URB>, Option<Vec<u8>>) -> CompletionResult + Send>;
+#[derive(Debug)]
+pub enum CompletionError {
+    Unlinked(Option<Vec<u8>>), // the URB was unlinked and should be ignored
 }
 
 impl URB {
-    pub fn complete(mut self: Box<Self>, status: i32) {
-        let complete = self.complete.take().unwrap();
-        complete(self, status);
+    pub fn complete(
+        mut self: Box<Self>,
+        transfer_buffer: Option<Vec<u8>>,
+    ) -> Result<Option<Vec<u8>>, CompletionError> {
+        let f = self.complete.take().unwrap();
+        f(self, transfer_buffer)
     }
 }
 
@@ -282,7 +292,7 @@ impl Device {
                     wMaxPacketSize: (((64 & USB_ENDPOINT_MAXP_MASK)
                         as u16)
                         .to_le()),
-                    bInterval: 255,
+                    bInterval: 5, //255,
                     bRefresh: 0,
                     bSynchAddress: 0,
                 },
@@ -295,7 +305,7 @@ impl Device {
                     bmAttributes: USB_ENDPOINT_XFER_INT as u8,
                     wMaxPacketSize: ((64 & USB_ENDPOINT_MAXP_MASK) as u16)
                         .to_le(),
-                    bInterval: 255,
+                    bInterval: 5, //255,
                     bRefresh: 0,
                     bSynchAddress: 0,
                 },
@@ -312,52 +322,49 @@ impl Device {
         }
     }
 
-    pub fn submit(&self, mut urb: Box<URB>) -> R<()> {
-        match (urb.endpoint, urb.setup.direction()) {
+    pub fn submit(&self, urb: Box<URB>) -> R<()> {
+        let setup = SetupPacket::unpack(&urb.setup).unwrap();
+        match (urb.endpoint, setup.direction()) {
             (0, D2H) => {
-                self.ep0_dev2host(urb.setup, &mut urb.transfer_buffer)?;
-                urb.complete(0)
+                let buf = self.ep0_dev2host(setup)?;
+                urb.complete(Some(buf)).unwrap();
             }
             (0, H2D) => {
-                self.ep0_host2dev(urb.setup)?;
-                urb.complete(0)
+                self.ep0_host2dev(setup)?;
+                urb.complete(None).unwrap();
             }
             (n, _) => self.endpoints[n as usize - 1].send(urb).unwrap(),
         };
         Ok(())
     }
 
-    fn get_lang_descriptor(&self, sink: &mut dyn Write) -> IOR<()> {
+    fn get_lang_descriptor(&self) -> IOR<Vec<u8>> {
         let d = usb_string_descriptor {
             bLength: size_of::<usb_string_descriptor>() as u8,
             bDescriptorType: DT::String.to_primitive(),
             wData: [LANG_ID_EN_US.to_le()],
         };
-        write_struct(sink, &d)
+        let mut vec =
+            Vec::with_capacity(size_of::<usb_string_descriptor>());
+        write_struct(&mut vec, &d)?;
+        Ok(vec)
     }
 
-    fn get_string_descriptor(
-        &self,
-        index: u8,
-        sink: &mut dyn Write,
-    ) -> IOR<()> {
+    fn get_string_descriptor(&self, index: u8) -> IOR<Vec<u8>> {
         assert!(index > 0);
         let text = self.strings[index as usize];
         let utf16_len = text.encode_utf16().count();
-        let mut v = Vec::<u8>::with_capacity(utf16_len);
+        let mut v =
+            vec![2 + (utf16_len * 2) as u8, DT::String.to_primitive()];
         text.encode_utf16().for_each(|u| {
             let bs = u.to_le_bytes();
             v.push(bs[0]);
             v.push(bs[1])
         });
-        sink.write_all(&[
-            2 + (utf16_len * 2) as u8,
-            DT::String.to_primitive(),
-        ])?;
-        sink.write_all(&v)
+        Ok(v)
     }
 
-    fn get_descriptor(&self, req: SetupPacket, out: &mut [u8]) -> IOR<()> {
+    fn get_descriptor(&self, req: SetupPacket) -> IOR<Vec<u8>> {
         let (value, lang, length) = req.args();
         let [index, ty] = value.to_le_bytes();
         let r#type = DT::from_primitive(ty).unwrap();
@@ -365,13 +372,18 @@ impl Device {
             "GET_DESCRIPTOR: type: {:?} index: {} lang: {} length: {} ",
             r#type, index, lang, length
         );
-        let sink = &mut std::io::Cursor::new(out);
+        let mut out = vec![0u8; length as usize];
+        use std::io::Cursor;
+        let sink = &mut Cursor::<&mut [u8]>::new(&mut out);
         fn has_room(c: &std::io::Cursor<&mut [u8]>) -> bool {
             (c.position() as usize) < (c.get_ref().len() as usize)
         }
         use DescriptorType::*;
         match (r#type, index, lang) {
-            (Device, 0, 0) => write_struct(sink, &self.device_descriptor),
+            (Device, 0, 0) => {
+                write_struct(sink, &self.device_descriptor)?;
+                Ok(out)
+            }
             (Configuration, 0, 0) => {
                 write_struct(sink, &self.config_descriptor)?;
                 if has_room(sink) {
@@ -382,42 +394,34 @@ impl Device {
                         write_struct_limited(sink, epd, len)?
                     }
                 }
-                Ok(())
+                Ok(out)
             }
-            (String, 0, 0) => self.get_lang_descriptor(sink),
-            (String, i, LANG_ID_EN_US) => {
-                self.get_string_descriptor(i, sink)
-            }
+            (String, 0, 0) => self.get_lang_descriptor(),
+            (String, i, LANG_ID_EN_US) => self.get_string_descriptor(i),
             x => panic!("Unsupported descriptor: {:?}", x),
         }
     }
 
-    fn get_interface_descriptor(
-        &self,
-        req: SetupPacket,
-        mut out: &mut [u8],
-    ) -> IOR<()> {
+    fn get_interface_descriptor(&self, req: SetupPacket) -> IOR<Vec<u8>> {
         let (value, _, _) = req.args();
         let [_, desctype] = value.to_le_bytes();
         match desctype as u32 {
-            HID_DT_REPORT => out.write_all(&self.hid_report_descriptor),
+            HID_DT_REPORT => Ok(self.hid_report_descriptor.clone()),
             x => panic!("Unsupported descriptor type: {}", x),
         }
     }
 
-    fn ep0_dev2host(&self, req: SetupPacket, sink: &mut [u8]) -> IOR<()> {
+    fn ep0_dev2host(&self, req: SetupPacket) -> IOR<Vec<u8>> {
         match req.request_type() {
             (D2H, RT::Standard, RR::Device) => match req.std() {
-                SR::GetDescriptor => self.get_descriptor(req, sink),
+                SR::GetDescriptor => self.get_descriptor(req),
                 SR::GetStatus if matches!(req.args(), (0, 0, 2)) => {
-                    Ok(sink.copy_from_slice(&[1u8, 0]))
+                    Ok(vec![1u8, 0])
                 }
                 _ => unimplemented!(),
             },
             (D2H, RT::Standard, RR::Interface) => match req.std() {
-                SR::GetDescriptor => {
-                    self.get_interface_descriptor(req, sink)
-                }
+                SR::GetDescriptor => self.get_interface_descriptor(req),
                 _ => unimplemented!(),
             },
             x => panic!("Unsupported request: {:?}", x),
@@ -437,37 +441,17 @@ impl Device {
             _ => unimplemented!(),
         }
     }
-
-    // fn ep1_dev2host(&self, _buf: &mut [u8]) -> R<bool> {
-    //     log!("ep1 dev->host");
-    //     // while !self.parser.recv_queue.is_empty() {
-    //     //     self.parser.parse()?
-    //     // }
-    //     // if !self.parser.send_queue.is_empty() {
-    //     //     self.parser.unparse(buf)?;
-    //     //     Ok(true)
-    //     // } else {
-    //     //     Ok(false)
-    //     // }
-    //     Ok(true)
-    // }
-
-    // fn ep2_host2dev(&self, _data: &[u8]) -> R<bool> {
-    //     log!("ep2 host->dev");
-    //     //self.parser.recv_queue.push_back(data.to_vec());
-    //     Ok(true)
-    // }
 }
 
 #[test]
 fn test_get_device_descriptor() {
     let dev = Device::new(vec![]);
-    let mut sink = [0u8; size_of::<usb_device_descriptor>()];
     const GET_DEVICE_DESCRIPTOR: &[u8; 8] =
         include_bytes!("../poke/get-device-descriptor.dat");
     let setup = SetupPacket::unpack(GET_DEVICE_DESCRIPTOR).unwrap();
-    dev.ep0_dev2host(setup, &mut sink).unwrap();
-    let d = crate::binio::test::view_as::<usb_device_descriptor>(&sink);
+    let mut vec = dev.ep0_dev2host(setup).unwrap();
+    vec.resize(size_of::<usb_device_descriptor>(), 0);
+    let d = crate::binio::test::view_as::<usb_device_descriptor>(&vec);
     assert_eq!(d.bLength, size_of::<usb_device_descriptor>() as u8);
     assert_eq!(d.bDescriptorType, DT::Device.to_primitive());
     assert_eq!(d.bDeviceClass, USB_CLASS_PER_INTERFACE as u8);

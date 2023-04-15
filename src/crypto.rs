@@ -11,7 +11,6 @@ use cryptoki::object::{KeyType, ObjectClass, ObjectHandle};
 use cryptoki::session::Session;
 use cryptoki::slot::Slot;
 use secrecy::{zeroize::Zeroize, SecretString};
-use std::collections::HashMap;
 use std::convert::TryInto;
 use std::sync::{Arc, Mutex};
 
@@ -146,14 +145,18 @@ fn der_encode_signature(points: &[u8]) -> Vec<u8> {
 const SECRET_KEY_LABEL: &str = "softfido-secret-key";
 const TOKEN_COUNTER_LABEL: &str = "softfido-token-counter";
 
+// The challenge here is to avoid loading the module multiple times or
+// concurrently from different threads.  We don't bother with freeing
+// the module; once opened, it just stays there forever.
 fn get_pkcs11(module: &str) -> R<Pkcs11> {
     use cryptoki::context::CInitializeArgs;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
-    static PKCS11: Mutex<Option<HashMap<PathBuf, Pkcs11>>> =
+    static PKCS11: Mutex<Option<BTreeMap<PathBuf, Pkcs11>>> =
         Mutex::new(None);
     let pbuf = std::fs::canonicalize(module)?;
     let mut opt = PKCS11.lock().unwrap();
-    let map = opt.get_or_insert_with(HashMap::new);
+    let map = opt.get_or_insert_with(BTreeMap::new);
     match map.get(&pbuf) {
         Some(p) => Ok(p.clone()),
         None => {
@@ -497,7 +500,7 @@ pub mod tests {
         Ok(Token::new(lib, label, pin)?)
     }
 
-    fn get_token() -> R<Token> {
+    pub fn get_token() -> R<Token> {
         static TOKEN: Mutex<Option<Token>> = Mutex::new(None);
         match &mut *TOKEN.lock().unwrap() {
             Some(t) => Ok(t.clone()),

@@ -6,23 +6,25 @@ use crate::binio::{read_struct, write_struct};
 use crate::crypto::Token;
 use crate::ctaphid;
 use crate::error::{IOR, R};
-use crate::prompt::Prompt;
 use crate::usb;
-use packed_struct::PackedStruct;
-use std::io::{Error, ErrorKind, Read, Write};
+use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
+use std::io::{ErrorKind, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::raw::c_char;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 use usb::URB;
 
 struct USBIPServer<'a> {
     device: &'a usb::Device,
     stream: TcpStream,
+    active_urbs: Arc<Mutex<BTreeMap<u32, bool>>>,
 }
 
 const USBIP_VERSION: u16 = 0x0111;
 
-pub fn read_op_common(r: &mut dyn Read) -> Result<(u16, u32, u32), Error> {
+pub fn read_op_common(r: &mut dyn Read) -> IOR<(u16, u32, u32)> {
     Ok(read_struct::<op_common>(r)?.parse())
 }
 
@@ -69,8 +71,15 @@ fn usb_interface(dev: &usb::Device) -> usbip_usb_interface {
 fn write_submit_reply(
     stream: &mut dyn Write,
     header: &usbip_header,
-    data: &[u8],
+    buffer: Option<Vec<u8>>,
 ) -> IOR<()> {
+    let actual_length = match &buffer {
+        Some(v) => (v.len() as i32).to_be(),
+        None => {
+            let cmd = unsafe { header.u.cmd_submit };
+            cmd.transfer_buffer_length
+        }
+    };
     write_struct(
         stream,
         &usbip_header {
@@ -82,7 +91,7 @@ fn write_submit_reply(
             u: usbip_header__bindgen_ty_1 {
                 ret_submit: usbip_header_ret_submit {
                     status: 0,
-                    actual_length: (data.len() as i32).to_be(),
+                    actual_length,
                     start_frame: 0,
                     number_of_packets: 0,
                     error_count: 0,
@@ -91,7 +100,8 @@ fn write_submit_reply(
         },
     )?;
     if header.base.is_dev2host() {
-        stream.write(data)?;
+        //eprintln!("write: {:x?}", &buffer);
+        stream.write(&buffer.unwrap())?;
     }
     Ok(())
 }
@@ -99,7 +109,7 @@ fn write_submit_reply(
 pub fn write_submit_reply_error(
     stream: &mut dyn Write,
     header: &usbip_header,
-) -> Result<(), Error> {
+) -> IOR<()> {
     write_struct(
         stream,
         &usbip_header {
@@ -110,7 +120,7 @@ pub fn write_submit_reply_error(
             },
             u: usbip_header__bindgen_ty_1 {
                 ret_submit: usbip_header_ret_submit {
-                    status: 1,
+                    status: 123,
                     actual_length: 0,
                     start_frame: 0,
                     number_of_packets: 0,
@@ -119,13 +129,15 @@ pub fn write_submit_reply_error(
             },
         },
     )
+    .unwrap();
+    todo!();
 }
 
 pub fn write_unlink_reply(
     stream: &mut dyn Write,
     header: &usbip_header,
     status: i32,
-) -> Result<(), Error> {
+) -> IOR<()> {
     write_struct(
         stream,
         &usbip_header {
@@ -170,7 +182,7 @@ impl op_import_request {
     }
 }
 
-fn read_busid(stream: &mut dyn Read) -> Result<String, Error> {
+fn read_busid(stream: &mut dyn Read) -> IOR<String> {
     Ok(read_struct::<op_import_request>(stream)?.parse())
 }
 
@@ -178,12 +190,13 @@ pub fn read_cmd_header(r: &mut dyn Read) -> IOR<Box<usbip_header>> {
     Ok(Box::new(read_struct(r)?))
 }
 
-pub fn start_server<'a>(l: &TcpListener, t: Token, p: Box<dyn Prompt>) {
+pub fn start_server<'a>(l: &TcpListener, t: Token, p: ctaphid::Prompt) {
     let parser = ctaphid::Parser::new(t, p);
     let dev = usb::Device::new(vec![parser.1, parser.0]);
     for s in l.incoming() {
-        println!("New connection {:?}\n", s);
-        serve(s.unwrap(), &dev).unwrap();
+        let tcpstream = s.unwrap();
+        log!("TCP: {:?}\n", tcpstream);
+        serve(tcpstream, &dev).unwrap();
     }
 }
 
@@ -192,6 +205,7 @@ fn serve<'a>(s: TcpStream, dev: &'a usb::Device) -> R<()> {
     let mut server = USBIPServer::<'a> {
         device: dev,
         stream: s,
+        active_urbs: Arc::new(Mutex::new(BTreeMap::new())),
     };
     server.start()
 }
@@ -220,15 +234,11 @@ type CompletionArgs = (Box<usbip_header>, Box<URB>, i32);
 
 fn completion_loop(rx: Receiver<CompletionArgs>, mut out: TcpStream) {
     for (header, urb, status) in rx {
-        log!("complete: {:?}", &header.base.seqnum());
+        //log!("seqnum: {} complete", &header.base.seqnum());
         match status {
             0 => {
-                write_submit_reply(
-                    &mut out,
-                    &header,
-                    &urb.transfer_buffer,
-                )
-                .unwrap();
+                write_submit_reply(&mut out, &header, urb.transfer_buffer)
+                    .unwrap();
             }
             err => {
                 println!("Request Error: {} {:?}", err, err);
@@ -236,6 +246,7 @@ fn completion_loop(rx: Receiver<CompletionArgs>, mut out: TcpStream) {
             }
         }
     }
+    log!("completion loop finished");
 }
 
 impl<'a> USBIPServer<'a> {
@@ -292,7 +303,7 @@ impl<'a> USBIPServer<'a> {
                 };
             match u32::from_be(header.base.command) {
                 USBIP_CMD_SUBMIT => {
-                    log!("CMD_SUBMIT");
+                    //log!("CMD_SUBMIT");
                     self.handle_submit(header, completion_port.clone())?;
                 }
                 USBIP_CMD_UNLINK => self.handle_unlink(header)?,
@@ -315,43 +326,75 @@ impl<'a> USBIPServer<'a> {
             i32::from_be(cmd.transfer_buffer_length) as usize;
         assert!(transfer_flags & !usb::URB_DIR_MASK == 0);
         //println!("transfer_buffer_length: {}", transfer_buffer_length);
-        let mut transfer_buffer = vec![0u8; transfer_buffer_length];
-        let setup = usb::SetupPacket::unpack(&cmd.setup).unwrap();
-        log!(
-            "handle_submit ep: {} {} seqnum: {} transfer: {} setup={:?}",
-            endpoint,
-            if dev2host { "dev->host" } else { "host->dev" },
-            seqnum,
-            transfer_buffer_length,
-            &cmd.setup
-        );
-        if !dev2host {
-            self.stream.read_exact(&mut transfer_buffer)?
-        }
-        let snd = Box::new(move |urb, status| {
-            completion_port.send((header, urb, status)).unwrap()
+        // log!(
+        //     "handle_submit ep: {} {} seqnum: {} transfer: {}",
+        //     endpoint,
+        //     if dev2host { "dev->host" } else { "host->dev" },
+        //     seqnum,
+        //     transfer_buffer_length
+        // );
+        let transfer_buffer = if dev2host {
+            None
+        } else {
+            let mut buf = vec![0u8; transfer_buffer_length];
+            self.stream.read_exact(&mut buf)?;
+            Some(buf)
+        };
+        let active_urbs = self.active_urbs.clone();
+        let send = Box::new(move |mut urb: Box<URB>, buf| {
+            let seqnum = header.base.seqnum();
+            match active_urbs.lock().unwrap().entry(seqnum) {
+                Entry::Occupied(e) => {
+                    let unlinked = *e.get();
+                    e.remove();
+                    if unlinked {
+                        return Err(usb::CompletionError::Unlinked(buf));
+                    }
+                }
+                Entry::Vacant(_) => panic!("urb not in active_urbs"),
+            };
+            let old = urb.transfer_buffer;
+            urb.transfer_buffer = buf;
+
+            completion_port.send((header, urb, 0)).unwrap();
+            Ok(old)
         });
         let urb = Box::new(usb::URB {
-            setup,
-            transfer_buffer,
             endpoint,
-            complete: Some(snd),
-            status: None,
+            setup: cmd.setup,
+            transfer_buffer,
+            transfer_buffer_length,
+            complete: Some(send),
         });
+        self.active_urbs.lock().unwrap().insert(seqnum, false);
         self.device.submit(urb)
     }
 
-    fn handle_unlink(&mut self, header: Box<usbip_header>) -> R<()> {
+    fn handle_unlink(&mut self, header: Box<usbip_header>) -> IOR<()> {
         let useqnum = u32::from_be(unsafe { header.u.cmd_unlink.seqnum });
-        log!("CMD_UNLINK: useqnum {} ", useqnum);
+        let ep = u32::from_be(header.base.ep);
+        let seq = u32::from_be(header.base.seqnum);
+        log!("CMD_UNLINK: useqnum={} ep={} seqnum={}", useqnum, ep, seq);
+        let status =
+            match &mut self.active_urbs.lock().unwrap().entry(useqnum) {
+                Entry::Occupied(e) => {
+                    e.insert(true);
+                    0
+                }
+                Entry::Vacant(_) => {
+                    // TODO: Write a test case for this
+                    -(ENOENT as i32)
+                }
+            };
+        write_unlink_reply(&mut self.stream, &header, status)
         //todo!();
         // let status: i32 = match found {
         //     true => -(EINPROGRESS as i32),
         //     false => -(ENOENT as i32),
         // };
-        let status = -(ENOENT as i32);
-        write_unlink_reply(&mut self.stream, &header, status)?;
-        Ok(())
+        // let status = -(ENOENT as i32);
+        // write_unlink_reply(&mut self.stream, &header, status)?;
+        // Ok(())
     }
 }
 

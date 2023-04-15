@@ -1,20 +1,22 @@
 #  Copyright: Helmut Eller
 #  SPDX-License-Identifier: GPL-3.0-or-later
 
-#import fido2
-## .hid import CtapHidDevice
 import fido2
+import fido2.features
+fido2.features.webauthn_json_mapping.enabled = False
+
 from fido2.hid import CtapHidDevice
-from fido2._pyu2f import hidtransport
 from fido2 import ctap2
 from fido2.cose import ES256
 from binascii import a2b_hex
-
-# dev = hid.Open( '/dev/hidraw24')
-# hidtransport.UsbHidTransport(dev)
-
-def test_enum_hid (): return list(hidtransport.hid.Enumerate())
-#dev = fido2._pyu2f.hidtransport.hid.Open( '/dev/hidraw1')
+from fido2 import server
+from fido2 import attestation
+from fido2 import client
+from fido2.utils import websafe_encode, websafe_decode, sha256
+import pprint
+import time
+import unittest
+import threading
 
 def test_open ():
     devnames = test_enum_hid()
@@ -28,7 +30,7 @@ def open_ctaphid_device():
     raise Exception("Can't open ctaphid device")
 
 def test_ping(): return open_ctaphid_device().ping()
-def open_ctap(): return ctap2.CTAP2(open_ctaphid_device())
+def open_ctap(): return ctap2.Ctap2(open_ctaphid_device())
 def test_get_info(): return open_ctap().get_info()
 
 rp = {'id': 'example.com', 'name': 'Example RP'}
@@ -46,11 +48,18 @@ def test_make_credential():
                                        on_keepalive=on_keepalive)
 
 def test_timeout():
+    event = threading.Event()
+    threading.Timer(0.2, event.set).start()
+    def on_keepalive (status):
+        #print("on_keepalive: ", status)
+        pass
     return open_ctap().make_credential(b'hash',
                                        {'id': "timeout.com",
                                         'name': "Please don't confirm"},
                                        user, key_params,
-                                       timeout=0.1)
+                                       on_keepalive=on_keepalive,
+                                       event=event
+                                       )
 
 def test_failed_assertion():
     client_data_hash = a2b_hex(
@@ -64,35 +73,31 @@ def test_failed_assertion():
                                      None,
                                      {"up": False})
 
-from fido2 import server
-from fido2 import attestation
-from fido2 import client
-from fido2.utils import websafe_encode
-
 def make_server():
-    return server.Fido2Server(server.RelyingParty("foo.com", "foosite"),
-                              attestation_types=attestation.NoneAttestation())
+    attestation = fido2.attestation.NoneAttestation()
+    return fido2.server.Fido2Server({"id": "foo.com", "name": "foosite"},
+                                    attestation=attestation)
 
 def test_register_and_authenticate():
     s = make_server()
-    user = {"id": b'"user-id"', "name": "username",
+    user = {"id": b'user-reg-id',
+            "name": "username",
             "displayName": "displayName"}
-    (args, state) = s.register_begin(user)
+    (create_options, state) = s.register_begin(user)
     c = client.Fido2Client(open_ctaphid_device(), "https://foo.com")
-    challenge = websafe_encode(args["publicKey"]["challenge"])
-    (att, client_data) = c.make_credential(args["publicKey"]["rp"],
-                                           user, challenge)
-    auth_data = s.register_complete(state, client_data, att)
-    (args, state) = s.authenticate_begin([auth_data.credential_data])
-    challenge = websafe_encode(args["publicKey"]["challenge"])
-    ([a], client_data) = c.get_assertion(
-        args["publicKey"]["rpId"],
-        challenge,
-        [{"type": "public-key",
-          "id": auth_data.credential_data.credential_id}],)
-    return s.authenticate_complete(state,[auth_data.credential_data],
-                                   auth_data.credential_data.credential_id,
-                                   client_data, a.auth_data, a.signature)
+    pub_key=create_options["publicKey"]
+    result = c.make_credential(pub_key)
+    auth_data = s.register_complete(state, result.client_data,
+                                    result.attestation_object)
+    credentials = [auth_data.credential_data]
+    (aoptions, state) = s.authenticate_begin(credentials)
+    rs = c.get_assertion(aoptions["publicKey"])
+    r = rs.get_response(0)
+    return s.authenticate_complete(state,credentials,
+                                   r.credential_id,
+                                   r.client_data,
+                                   r.authenticator_data,
+                                   r.signature)
 
 def test_tampered_rp_id():
     user = {'id': b'user_id',
@@ -109,16 +114,10 @@ def test_tampered_rp_id():
         [{"type": "public-key",
           "id": cred.auth_data.credential_data.credential_id}],)
 
-def open_ctap1 (): return fido2.ctap1.CTAP1(open_ctaphid_device())
-
-#
-import unittest
-import threading
+def open_ctap1 (): return fido2.ctap1.Ctap1(open_ctaphid_device())
 
 class Tests(unittest.TestCase):
 
-    def test_enum_hid(self):
-        self.assertTrue(len(test_enum_hid()) > 0)
 
     def test_list_devices(self):
         self.assertTrue(len(test_list_devices()) > 0)
@@ -133,7 +132,8 @@ class Tests(unittest.TestCase):
         self.assertEqual(test_get_info().versions, ['FIDO_2_0', 'U2F_V2'])
 
     def test_make_credential(self):
-        self.assertIsInstance(test_make_credential(), ctap2.AttestationObject)
+        cred = test_make_credential()
+        self.assertIsInstance(cred, ctap2.AttestationResponse)
 
     def test_timeout(self):
         try:
@@ -141,7 +141,33 @@ class Tests(unittest.TestCase):
         except Exception as e:
             self.assertIsInstance(e, fido2.ctap.CtapError)
             self.assertEqual(e.code,
-                             fido2.ctap.CtapError.ERR.INVALID_COMMAND)
+                             fido2.ctap.CtapError.ERR.KEEPALIVE_CANCEL)
+        else:
+            self.assertTrue(False)
+
+    def test_deny_credentials(self):
+        rp = {'id': "test-deny-credentials",
+              'name': "Please deny your consent"}
+        try:
+            open_ctap().make_credential(b'hash', rp, user, key_params)
+        except Exception as e:
+            self.assertIsInstance(e, fido2.ctap.CtapError)
+            self.assertEqual(e.code,
+                             fido2.ctap.CtapError.ERR.OPERATION_DENIED)
+        else:
+            self.assertTrue(False)
+
+    def test_close_window(self):
+        rp = {'id': "test-close-window",
+              'name': "Don't answer; close the window instead"}
+        try:
+            open_ctap().make_credential(b'hash', rp, user, key_params)
+        except Exception as e:
+            self.assertIsInstance(e, fido2.ctap.CtapError)
+            self.assertEqual(e.code,
+                             fido2.ctap.CtapError.ERR.OPERATION_DENIED)
+        else:
+            self.assertTrue(False)
 
     def test_failed_assertion (self):
         try:
@@ -154,8 +180,8 @@ class Tests(unittest.TestCase):
             self.assertTrue(False)
 
     def test_register_and_authenticate(self):
-        self.assertIsInstance(test_register_and_authenticate(),
-                              fido2.ctap2.AttestedCredentialData)
+        result = test_register_and_authenticate()
+        self.assertIsInstance(result, fido2.webauthn.AttestedCredentialData)
 
     def test_tampered_rp_id(self):
         try:
@@ -167,14 +193,34 @@ class Tests(unittest.TestCase):
         else:
             self.assertTrue(False)
 
+    def test_deny_challenge(self):
+        user = {'id': b'user_id',
+                'displayName': 'auser@example.com',
+                'name': "A. User" }
+        rp = {'id': "test-deny-challenge", 'name': "Name"}
+        dev = open_ctap()
+        cred = dev.make_credential(b'hash', rp, user, key_params)
+        challenge = b'Y2hhbGxlbmdl'
+        try:
+            dev.get_assertion(
+                rp["id"],
+                challenge,
+                [{"type": "public-key",
+                  "id": cred.auth_data.credential_data.credential_id}],)
+        except Exception as e:
+            self.assertIsInstance(e, fido2.ctap.CtapError)
+            self.assertEqual(e.code,
+                             fido2.ctap.CtapError.ERR.OPERATION_DENIED)
+        else:
+            self.assertTrue(False)
+
     def test_open_ctap1(self):
-        self.assertIsInstance(open_ctap1(), fido2.ctap1.CTAP1)
+        self.assertIsInstance(open_ctap1(), fido2.ctap1.Ctap1)
 
     def test_u2f_version(self):
         self.assertEqual(open_ctap1().get_version(), 'U2F_V2')
 
     def test_u2f_register(self):
-        sha256 = fido2.utils.sha256
         clientdata = sha256(b'AAA')
         appid = sha256(b'BBB')
         regdata = open_ctap1().register(clientdata, appid)
@@ -182,7 +228,6 @@ class Tests(unittest.TestCase):
         regdata.verify(appid, clientdata)
 
     def test_u2f_authenticate(self):
-        sha256 = fido2.utils.sha256
         clientdata = sha256(b'AAA')
         appid = sha256(b'BBB')
         ctap1 = open_ctap1()
@@ -193,8 +238,30 @@ class Tests(unittest.TestCase):
         self.assertIsInstance(auth, fido2.ctap1.SignatureData)
         auth.verify(appid, clientdata, regdata.public_key)
 
+    def test_u2f_client(self):
+        s = make_server()
+        user = {"id": b'user-reg-id',
+                "name": "username",
+                "displayName": "displayName"}
+        (create_options, state) = s.register_begin(user)
+        dev = open_ctaphid_device()
+        c = client.Fido2Client(dev, "https://foo.com")
+        c._backend = client._Ctap1ClientBackend(dev, client.UserInteraction())
+        pub_key=create_options["publicKey"]
+        result = c.make_credential(pub_key)
+        auth_data = s.register_complete(state, result.client_data,
+                                        result.attestation_object)
+        credentials = [auth_data.credential_data]
+        (aoptions, state) = s.authenticate_begin(credentials)
+        rs = c.get_assertion(aoptions["publicKey"])
+        r = rs.get_response(0)
+        return s.authenticate_complete(state,credentials,
+                                       r.credential_id,
+                                       r.client_data,
+                                       r.authenticator_data,
+                                   r.signature)
+
     def test_u2f_counter(self):
-        sha256 = fido2.utils.sha256
         clientdata = sha256(b'AAA')
         appid = sha256(b'BBB')
         ctap1 = open_ctap1()
@@ -210,54 +277,65 @@ class Tests(unittest.TestCase):
         self.assertTrue(auth1.counter < auth2.counter)
 
     def test_counter(self):
+        rp = {'id': 'example.com', 'name': 'Example RP'}
         dev = open_ctaphid_device()
         client = fido2.client.Fido2Client(dev, "https://example.com")
-        rp = {'id': 'example.com', 'name': 'Example RP'}
         user = {'id': b'user_id', 'name': 'A. User'}
-        pin = None
-        challenge1 = 'Y2hhbGxlbmdl'
-        attestation_object, client_data = client.make_credential(
-            rp, user, challenge1, pin=pin)
-        verifier = fido2.attestation.Attestation.for_type(
-            attestation_object.fmt)
-        verifier().verify(attestation_object.att_statement,
-                          attestation_object.auth_data,
-                          client_data.hash)
-        credential = attestation_object.auth_data.credential_data
-        challenge2 = 'Q0hBTExFTkdF'  # Use a new challenge for each call.
-        allow_list = [{
-            'type': 'public-key',
-            'id': credential.credential_id
-        }]
-        assertions1, client_data1 = client.get_assertion(
-            rp['id'], challenge2, allow_list, pin=pin)
-        assertion1 = assertions1[0]
-        assertion1.verify(client_data1.hash, credential.public_key)
-        challenge3 = 'yooT1AiB'  # Use a new challenge for each call.
-        assertions2, client_data2 = client.get_assertion(
-            rp['id'], challenge3, allow_list, pin=pin)
-        assertion2 = assertions2[0]
-        assertion2.verify(client_data2.hash, credential.public_key)
-        self.assertTrue(assertion1.auth_data.counter
-                        < assertion2.auth_data.counter)
+        challenge1 = b'Y2hhbGxlbmdl'
+        cred = client.make_credential({
+            "rp": rp,
+            "user": user,
+            "challenge": challenge1,
+            "pubKeyCredParams": key_params})
+        credential_data = cred.attestation_object.auth_data.credential_data
+        public_key = credential_data.public_key
+        challenge2 = b'Q0hBTExFTkdF'  # Use a new challenge for each call.
+        allow_list = [{'type': 'public-key',
+                       'id': credential_data.credential_id}]
+        assertions1 = client.get_assertion({
+            "rpId": rp["id"],
+            "challenge": challenge2,
+            "allowCredentials": allow_list})
+        assertion1 = assertions1.get_response(0)
+        challenge3 = b'yooT1AiB'
+        assertions2 = client.get_assertion({
+            "rpId": rp["id"],
+            "challenge": challenge3,
+            "allowCredentials": allow_list})
+        assertion2 = assertions2.get_response(0)
+        public_key.verify(
+            assertion1.authenticator_data + assertion1.client_data.hash,
+            assertion1.signature)
+        public_key.verify(
+            assertion2.authenticator_data + assertion2.client_data.hash,
+            assertion2.signature)
+        self.assertTrue(assertion1.authenticator_data.counter
+                        < assertion2.authenticator_data.counter)
 
-
+    @unittest.skip("""This fails because we get a "Wrong Channel"
+    exception.  It seems that the python-fido2 code is buggy in this
+    regard.  I think that it should skip/ignore packets that are not
+    sent to the current channel. (USB is more or less a "bus" and if
+    there are multiple clients, then every client will see all packets
+    on the bus.""")
     def test_multichannel(self):
         dev1 = open_ctaphid_device()
         dev2 = open_ctaphid_device()
-        client2 = fido2.client.Fido2Client(dev2, "https://example2.com")
         client1 = fido2.client.Fido2Client(dev1, "https://example1.com")
+        client2 = fido2.client.Fido2Client(dev2, "https://example2.com")
         rp1 = {'id': 'example1.com', 'name': 'Example RP'}
         rp2 = {'id': 'example2.com', 'name': 'Example RP'}
         user = {'id': b'user_id', 'name': 'A. User'}
-        pin = None
-        challenge1 = 'Y2hhbGxlbmdl'
+        challenge1 = b'Y2hhbGxlbmdl'
         results = [None, None]
-        barrier = threading.Barrier(3, timeout=10)
+        barrier = threading.Barrier(3, timeout=5)
         def make_credential(index, client, rp):
             try:
-                results[index] = client.make_credential(
-                    rp, user, challenge1, pin=pin)
+                results[index] = client.make_credential({
+                    "rp": rp,
+                    "user": user,
+                    "challenge": challenge1,
+                    "pubKeyCredParams": key_params})
             except Exception as e:
                 results[index] = e
             barrier.wait()
@@ -265,43 +343,15 @@ class Tests(unittest.TestCase):
         threading.Thread(target=make_credential,args=(1,client2,rp2)).start()
         barrier.wait()
         for r in results:
-            if isinstance(r, fido2.ctap.CtapError):
-                self.assertEqual(r.code,
+            print(f"{type(r)}")
+            if (isinstance(r, fido2.client.ClientError) and
+                isinstance(r.cause, fido2.ctap.CtapError)):
+                self.assertEqual(r.cause.code,
                                  fido2.ctap.CtapError.ERR.CHANNEL_BUSY)
-            if isinstance(r, tuple):
-                (attestation_object, client_data) = r
-                verifier = fido2.attestation.Attestation.for_type(
-                    attestation_object.fmt)
-                verifier().verify(attestation_object.att_statement,
-                                  attestation_object.auth_data,
-                                  client_data.hash)
-
-    def test_timeout_get_assertion (self):
-        dev = open_ctaphid_device()
-        client = fido2.client.Fido2Client(dev, "https://example.com")
-        rp = {'id': 'example.com', 'name': 'Example RP'}
-        user = {'id': b'user_id', 'name': 'A. User'}
-        pin = None
-        challenge1 = 'Y2hhbGxlbmdl'
-        attestation_object, client_data = client.make_credential(
-            rp, user, challenge1, pin=pin)
-        verifier = fido2.attestation.Attestation.for_type(
-            attestation_object.fmt)
-        verifier().verify(attestation_object.att_statement,
-                          attestation_object.auth_data,
-                          client_data.hash)
-        credential = attestation_object.auth_data.credential_data
-        challenge2 = 'Q0hBTExFTkdF'  # Use a new challenge for each call.
-        allow_list = [{
-            'type': 'public-key',
-            'id': credential.credential_id
-        }]
-        try:
-            assertions1, client_data1 = client.get_assertion(
-                rp['id'], challenge2, allow_list, pin=pin, timeout=0.1)
-        except Exception as e:
-            self.assertEqual(e.__context__.code,
-                             fido2.ctap.CtapError.ERR.INVALID_COMMAND)
+            else:
+                self.assertIsInstance(
+                    r,
+                    fido2.webauthn.AuthenticatorAttestationResponse)
 
 if __name__ == '__main__':
     unittest.main()

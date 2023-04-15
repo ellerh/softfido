@@ -5,13 +5,6 @@
 use crate::error::R;
 use pinentry;
 use secrecy::SecretString;
-use std::sync::mpsc::Receiver;
-
-pub trait Prompt: Send {
-    fn yes_or_no_p(&self, prompt: &str) -> Receiver<Result<bool, String>>;
-}
-
-pub struct Pinentry;
 
 // FIXME: report report this as bug to the pinentry_rs maintainer.
 fn escape_string(s: &str) -> String {
@@ -19,29 +12,18 @@ fn escape_string(s: &str) -> String {
     s.into()
 }
 
-impl Prompt for Pinentry {
-    fn yes_or_no_p(&self, prompt: &str) -> Receiver<Result<bool, String>> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        let escaped = escape_string(prompt);
-        std::thread::spawn(move || {
-            let mut d =
-                match pinentry::ConfirmationDialog::with_default_binary() {
-                    Some(d) => d,
-                    None => {
-                        return sender.send(Err(
-                            "pinentry cannot be found in PATH".into(),
-                        ))
-                    }
-                };
-            let msg: Result<bool, String> = d
-                .with_ok("Yes")
-                .with_cancel("No")
-                .confirm(&escaped)
-                .map_err(|e| e.to_string());
-            sender.send(msg)
-        });
-        receiver
-    }
+pub fn yes_or_no_p(prompt: &str) -> Result<bool, String> {
+    let escaped = escape_string(prompt);
+    let mut dialog =
+        match pinentry::ConfirmationDialog::with_default_binary() {
+            Some(d) => d,
+            None => return Err("pinentry cannot be found in PATH".into()),
+        };
+    dialog
+        .with_ok("Yes")
+        .with_cancel("No")
+        .confirm(&escaped)
+        .map_err(|e| format!("{:?}", e))
 }
 
 pub fn read_pin(prompt: &str) -> R<SecretString> {

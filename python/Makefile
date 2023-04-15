@@ -8,6 +8,7 @@ HOSTIP=$(word 1,$(shell hostname -I))
 
 check: ensure-vm-running build-test-server
 	set -e ; \
+	rm -f /tmp/test-server.stdout ; \
 	cargo run --bin test-server \
 	2>/tmp/test-server.stderr >/tmp/test-server.stdout & \
         trap "kill $$!" EXIT 15 2 ; \
@@ -15,7 +16,10 @@ check: ensure-vm-running build-test-server
 	   sleep 0.2 ; \
         done && \
 	$(SSH) "sudo usbip attach -r $(HOSTIP) -d 1-1 && \
-	cd softfido/python && make test"
+	cd softfido/python && \
+	for i in 1 2 ; do \
+          make test; \
+        done"
 
 ensure-vm-running:
 	$(SSH) 'sudo modprobe vhci-hcd'
