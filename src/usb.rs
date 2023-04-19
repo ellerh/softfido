@@ -1,12 +1,10 @@
 use crate::bindings::*;
 use crate::binio::{write_struct, write_struct_limited};
-use crate::error::{IOR, R};
+use crate::error::R;
 use crate::hid;
-use packed_struct::prelude::*;
-//use packed_struct::PackedStruct;
-use packed_struct::PrimitiveEnum;
+use packed_struct::prelude::PackedStruct;
+use packed_struct::prelude::{PrimitiveEnum, PrimitiveEnum_u8};
 use std::convert::TryFrom;
-//use std::io::Write;
 use std::mem::size_of;
 use std::sync::mpsc::Sender;
 
@@ -43,17 +41,11 @@ impl SetupPacket {
         self.bm_request_type.direction
     }
     fn args(self) -> (u16, u16, u16) {
-        (
-            u16::from_le(self.w_value),
-            u16::from_le(self.w_index),
-            u16::from_le(self.w_length),
-        )
+        (self.w_value, self.w_index, self.w_length)
     }
-
     fn std(self) -> StandardRequest {
         StandardRequest::from_primitive(self.b_request).unwrap()
     }
-
     fn hid_request(self) -> (HIDRequest, (u16, u16, u16)) {
         (
             HIDRequest::from_primitive(self.b_request).unwrap(),
@@ -326,11 +318,11 @@ impl Device {
         let setup = SetupPacket::unpack(&urb.setup).unwrap();
         match (urb.endpoint, setup.direction()) {
             (0, D2H) => {
-                let buf = self.ep0_dev2host(setup)?;
+                let buf = self.ep0_dev2host(setup);
                 urb.complete(Some(buf)).unwrap();
             }
             (0, H2D) => {
-                self.ep0_host2dev(setup)?;
+                self.ep0_host2dev(setup);
                 urb.complete(None).unwrap();
             }
             (n, _) => self.endpoints[n as usize - 1].send(urb).unwrap(),
@@ -338,7 +330,7 @@ impl Device {
         Ok(())
     }
 
-    fn get_lang_descriptor(&self) -> IOR<Vec<u8>> {
+    fn get_lang_descriptor(&self) -> Vec<u8> {
         let d = usb_string_descriptor {
             bLength: size_of::<usb_string_descriptor>() as u8,
             bDescriptorType: DT::String.to_primitive(),
@@ -346,11 +338,11 @@ impl Device {
         };
         let mut vec =
             Vec::with_capacity(size_of::<usb_string_descriptor>());
-        write_struct(&mut vec, &d)?;
-        Ok(vec)
+        write_struct(&mut vec, &d).unwrap();
+        vec
     }
 
-    fn get_string_descriptor(&self, index: u8) -> IOR<Vec<u8>> {
+    fn get_string_descriptor(&self, index: u8) -> Vec<u8> {
         assert!(index > 0);
         let text = self.strings[index as usize];
         let utf16_len = text.encode_utf16().count();
@@ -361,10 +353,10 @@ impl Device {
             v.push(bs[0]);
             v.push(bs[1])
         });
-        Ok(v)
+        v
     }
 
-    fn get_descriptor(&self, req: SetupPacket) -> IOR<Vec<u8>> {
+    fn get_descriptor(&self, req: SetupPacket) -> Vec<u8> {
         let (value, lang, length) = req.args();
         let [index, ty] = value.to_le_bytes();
         let r#type = DT::from_primitive(ty).unwrap();
@@ -381,64 +373,63 @@ impl Device {
         use DescriptorType::*;
         match (r#type, index, lang) {
             (Device, 0, 0) => {
-                write_struct(sink, &self.device_descriptor)?;
-                Ok(out)
+                write_struct(sink, &self.device_descriptor).unwrap();
+                out
             }
             (Configuration, 0, 0) => {
-                write_struct(sink, &self.config_descriptor)?;
+                write_struct(sink, &self.config_descriptor).unwrap();
                 if has_room(sink) {
-                    write_struct(sink, &self.interface_descriptor)?;
-                    write_struct(sink, &self.hid_descriptor)?;
+                    write_struct(sink, &self.interface_descriptor)
+                        .unwrap();
+                    write_struct(sink, &self.hid_descriptor).unwrap();
                     for epd in self.endpoint_descriptors.iter() {
                         let len = epd.bLength as usize;
-                        write_struct_limited(sink, epd, len)?
+                        write_struct_limited(sink, epd, len).unwrap()
                     }
                 }
-                Ok(out)
+                out
             }
             (String, 0, 0) => self.get_lang_descriptor(),
             (String, i, LANG_ID_EN_US) => self.get_string_descriptor(i),
-            x => panic!("Unsupported descriptor: {:?}", x),
+            _ => todo!(),
         }
     }
 
-    fn get_interface_descriptor(&self, req: SetupPacket) -> IOR<Vec<u8>> {
+    fn get_interface_descriptor(&self, req: SetupPacket) -> Vec<u8> {
         let (value, _, _) = req.args();
         let [_, desctype] = value.to_le_bytes();
         match desctype as u32 {
-            HID_DT_REPORT => Ok(self.hid_report_descriptor.clone()),
-            x => panic!("Unsupported descriptor type: {}", x),
+            HID_DT_REPORT => self.hid_report_descriptor.clone(),
+            _ => todo!(),
         }
     }
 
-    fn ep0_dev2host(&self, req: SetupPacket) -> IOR<Vec<u8>> {
+    fn ep0_dev2host(&self, req: SetupPacket) -> Vec<u8> {
         match req.request_type() {
             (D2H, RT::Standard, RR::Device) => match req.std() {
                 SR::GetDescriptor => self.get_descriptor(req),
-                SR::GetStatus if matches!(req.args(), (0, 0, 2)) => {
-                    Ok(vec![1u8, 0])
-                }
-                _ => unimplemented!(),
+                SR::GetStatus if req.args() == (0, 0, 2) => vec![1u8, 0],
+                _ => todo!(),
             },
             (D2H, RT::Standard, RR::Interface) => match req.std() {
                 SR::GetDescriptor => self.get_interface_descriptor(req),
-                _ => unimplemented!(),
+                _ => todo!(),
             },
-            x => panic!("Unsupported request: {:?}", x),
+            _ => todo!(),
         }
     }
 
-    fn ep0_host2dev(&self, req: SetupPacket) -> IOR<()> {
+    fn ep0_host2dev(&self, req: SetupPacket) {
         match req.request_type() {
             (H2D, RT::Standard, RR::Device) => match req.std() {
-                SR::SetConfiguration if req.args() == (0, 0, 0) => Ok(()),
-                _ => unimplemented!(),
+                SR::SetConfiguration if req.args() == (0, 0, 0) => (),
+                _ => todo!(),
             },
             (H2D, RT::Class, RR::Interface) => match req.hid_request() {
-                (HIDRequest::SetIdle, (0, 0, 0)) => Ok(()),
-                _ => unimplemented!(),
+                (HIDRequest::SetIdle, (0, 0, 0)) => (),
+                _ => todo!(),
             },
-            _ => unimplemented!(),
+            _ => todo!(),
         }
     }
 }
@@ -449,12 +440,33 @@ fn test_get_device_descriptor() {
     const GET_DEVICE_DESCRIPTOR: &[u8; 8] =
         include_bytes!("../poke/get-device-descriptor.dat");
     let setup = SetupPacket::unpack(GET_DEVICE_DESCRIPTOR).unwrap();
-    let mut vec = dev.ep0_dev2host(setup).unwrap();
+    let mut vec = dev.ep0_dev2host(setup);
     vec.resize(size_of::<usb_device_descriptor>(), 0);
     let d = crate::binio::test::view_as::<usb_device_descriptor>(&vec);
     assert_eq!(d.bLength, size_of::<usb_device_descriptor>() as u8);
     assert_eq!(d.bDescriptorType, DT::Device.to_primitive());
     assert_eq!(d.bDeviceClass, USB_CLASS_PER_INTERFACE as u8);
     assert_eq!(d.bNumConfigurations, 1);
+    ()
+}
+
+#[test]
+fn test_get_interface_descriptor() {
+    let dev = Device::new(vec![]);
+    let setup = SetupPacket {
+        bm_request_type: BmRequestType {
+            direction: D2H,
+            recipient: RR::Interface,
+            type_: RT::Standard,
+        },
+        b_request: (SR::GetDescriptor).to_primitive(),
+        w_index: 0,
+        w_length: 64,
+        w_value: u16::from_le_bytes([0, HID_DT_REPORT as u8]),
+    };
+    let v = dev.ep0_dev2host(setup);
+    use hid::*;
+    assert_eq!(v[..3], usage_page(FIDO));
+    assert_eq!(v[3..5], usage(CTAPHID));
     ()
 }

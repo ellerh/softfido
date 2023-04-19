@@ -12,7 +12,10 @@ mod error;
 //mod eventloop;
 mod hid;
 //mod panic;
+mod ctap2;
+mod hex;
 pub mod prompt;
+mod u2f;
 mod usb;
 pub mod usbip;
 

@@ -19,6 +19,9 @@ use usb::URB;
 struct USBIPServer<'a> {
     device: &'a usb::Device,
     stream: TcpStream,
+    // The keys in the active_urbs map are the sequence number of
+    // usbip_headers.  The value is usually false, but we set it to to
+    // true when the URB has been unlinked.
     active_urbs: Arc<Mutex<BTreeMap<u32, bool>>>,
 }
 
@@ -387,14 +390,6 @@ impl<'a> USBIPServer<'a> {
                 }
             };
         write_unlink_reply(&mut self.stream, &header, status)
-        //todo!();
-        // let status: i32 = match found {
-        //     true => -(EINPROGRESS as i32),
-        //     false => -(ENOENT as i32),
-        // };
-        // let status = -(ENOENT as i32);
-        // write_unlink_reply(&mut self.stream, &header, status)?;
-        // Ok(())
     }
 }
 
