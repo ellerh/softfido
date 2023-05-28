@@ -6,7 +6,7 @@ pub type GetConsent<'a> = &'a dyn Fn(String) -> Result<bool, ()>;
 
 struct CTAP2<'a> {
     get_consent: GetConsent<'a>,
-    token: Token,
+    token: &'a Token,
 }
 
 type C2R = Result<Vec<u8>, u8>;
@@ -243,9 +243,8 @@ const ERR_INVALID_CREDENTIAL: u8 = 0x22;
 const AAGUID: u128 = 0x7ec96c58403748ed8e7eb2a1b538374e;
 //const AAGUID: u128 = 0x0;
 
-pub fn process_request(req: Vec<u8>, f: GetConsent, t: Token) -> Vec<u8> {
+pub fn process_request(req: Vec<u8>, f: GetConsent, t: &Token) -> Vec<u8> {
     let (cmd, cbor) = (req[0], &req[1..]);
-    log!("ctap2::process_request cmd: {:?}", cmd);
     let s = CTAP2 {
         get_consent: f,
         token: t,
@@ -268,7 +267,7 @@ pub fn process_request(req: Vec<u8>, f: GetConsent, t: Token) -> Vec<u8> {
 
 impl<'a> CTAP2<'a> {
     fn get_info(&self, cbor: &[u8]) -> C2R {
-        log!("get_info");
+        log!(CTAP, "get_info");
         assert!(cbor.len() == 0);
         let reply = GetInfoResponse {
             _padding: None,
@@ -286,7 +285,7 @@ impl<'a> CTAP2<'a> {
                 return Err(ERR_INVALID_CBOR);
             }
         };
-        log!("CTAP2_MAKE_CREDENTIAL {}", args.rp.id);
+        log!(CTAP, "make_credential {}", args.rp.id);
         if !args.user.id.0.len() <= 64 {
             todo!();
         }
@@ -309,7 +308,7 @@ Allow? ",
         match (self.get_consent)(prompt) {
             Ok(false) => return Err(ERR_OPERATION_DENIED),
             Err(()) => {
-                log!("ERR_KEEPALIVE_CANCEL");
+                log!(CTAP, "ERR_KEEPALIVE_CANCEL");
                 return Err(ERR_KEEPALIVE_CANCEL);
             }
             Ok(true) => (),
@@ -370,11 +369,11 @@ Allow? ",
         let args: GetAssertionArgs = match serde_cbor::from_slice(cbor) {
             Ok(x) => x,
             Err(e) => {
-                log!("failed to parse cbor: {}", e);
+                log!(CTAP, "failed to parse cbor: {}", e);
                 todo!() //return Err(ERR_INVALID_PAR);
             }
         };
-        log!("get_assertion {:?}", args);
+        log!(CTAP, "get_assertion {}", args.rp_id);
         if args.allow_list.len() != 1 {
             todo!()
         }

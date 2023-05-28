@@ -1,6 +1,10 @@
 
-# The check target assumens that a properly configured VM is running.
-# The VM should expose an SSH server on 127.0.0.1:2222 and the host
+test:
+	PYTHONPATH=/scratch/usb-fido/python-fido2/ \
+	python3 softfido_tests.py
+
+# The check target assumes that a properly configured VM is running.
+# The VM should expose an SSH server on 127.0.0.1:2222 and the softido
 # directory should be mounted inside the VM under ~user/softfido.
 
 SSH=ssh -p 2222 user@127.0.0.1
@@ -26,7 +30,3 @@ ensure-vm-running:
 
 build-test-server:
 	cargo build --bin test-server
-
-test:
-	 PYTHONPATH=/scratch/usb-fido/python-fido2/ \
-         python3 softfido_tests.py

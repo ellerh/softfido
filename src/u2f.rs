@@ -5,7 +5,7 @@ use ctap2::GetConsent;
 
 struct U2F<'a> {
     get_consent: GetConsent<'a>,
-    token: Token,
+    token: &'a Token,
 }
 
 type U2R = Result<Vec<u8>, u16>;
@@ -15,7 +15,7 @@ const SW_CONDITIONS_NOT_SATISFIED: u16 = 0x6985;
 //const SW_INS_NOT_SUPPORTED: u16 = 0x6D00;
 const SW_WRONG_DATA: u16 = 0x6A80;
 
-pub fn process_request(req: Vec<u8>, f: GetConsent, t: Token) -> Vec<u8> {
+pub fn process_request(req: Vec<u8>, f: GetConsent, t: &Token) -> Vec<u8> {
     let s = U2F {
         get_consent: f,
         token: t,
@@ -45,14 +45,13 @@ pub fn process_request(req: Vec<u8>, f: GetConsent, t: Token) -> Vec<u8> {
             todo!()
         }
     };
-    let response = match result {
+    match result {
         Ok(mut v) => {
             v.extend(SW_NO_ERROR.to_be_bytes());
             v
         }
         Err(code) => code.to_be_bytes().to_vec(),
-    };
-    response
+    }
 }
 
 impl<'a> U2F<'a> {
@@ -61,7 +60,7 @@ impl<'a> U2F<'a> {
     }
 
     fn u2f_register(&self, data: &[u8]) -> U2R {
-        log!("u2f_register: {:?}", &data);
+        log!(CTAP, "u2f_register: {:?}", &data);
         assert!(data.len() == 64);
         let challenge = &data[..32];
         let application = &data[32..];
@@ -77,10 +76,12 @@ application: {}
         if let Ok(false) | Err(()) = (self.get_consent)(query) {
             return Err(SW_CONDITIONS_NOT_SATISFIED);
         }
+        log!(CRYPTO, "generate_key_pair");
         let (wpriv, (x, y)) = self.token.generate_key_pair().unwrap();
         let pub_key = [&[4u8][..], &x, &y].concat();
         assert!(pub_key.len() == 65);
         assert!(wpriv.len() <= 255);
+        log!(CRYPTO, "encrypt rp_id");
         let credential_id = ctap2::CredentialId {
             wrapped_private_key: ctap2::Bytes(wpriv.clone()),
             encrypted_rp_id: ctap2::Bytes(
@@ -91,6 +92,7 @@ application: {}
         println!("application: {:?}", &application);
         let key_handle =
             serde_cbor::ser::to_vec_packed(&credential_id).unwrap();
+        log!(CRYPTO, "sign");
         let signature = self
             .token
             .sign(
@@ -107,6 +109,7 @@ application: {}
             .unwrap();
         let not_before = chrono::Utc::now();
         let not_after = not_before + chrono::Duration::days(30);
+        log!(CRYPTO, "create_certificate");
         let cert = self
             .token
             .create_certificate(
@@ -131,7 +134,7 @@ application: {}
     }
 
     fn u2f_authenticate(&self, control: u8, data: &[u8]) -> U2R {
-        log!("u2f_authenticate: 0x{:0x} {:?}", control, &data);
+        log!(CTAP, "u2f_authenticate: 0x{:0x} {:?}", control, &data);
         let challange = &data[..32];
         let application = &data[32..64];
         let l = data[64];
@@ -177,5 +180,14 @@ application: {}
             }
             _ => todo!(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    #[test]
+    fn registration() {
+        ()
     }
 }

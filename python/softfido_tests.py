@@ -47,14 +47,14 @@ def test_make_credential():
     return open_ctap().make_credential(b'hash', rp, user, key_params,
                                        on_keepalive=on_keepalive)
 
-def test_timeout():
+def test_timeout(timeout, label):
     event = threading.Event()
-    threading.Timer(0.2, event.set).start()
+    threading.Timer(timeout, event.set).start()
     def on_keepalive (status):
         #print("on_keepalive: ", status)
         pass
     return open_ctap().make_credential(b'hash',
-                                       {'id': "timeout.com",
+                                       {'id': label,
                                         'name': "Please don't confirm"},
                                        user, key_params,
                                        on_keepalive=on_keepalive,
@@ -137,13 +137,36 @@ class Tests(unittest.TestCase):
 
     def test_timeout(self):
         try:
-            test_timeout()
+            test_timeout(0.02, "timeout.com")
         except Exception as e:
             self.assertIsInstance(e, fido2.ctap.CtapError)
             self.assertEqual(e.code,
                              fido2.ctap.CtapError.ERR.KEEPALIVE_CANCEL)
+            for i in range(3):
+                time.sleep(0.1)
+                self.test_ping()
         else:
             self.assertTrue(False)
+
+    def test_timeout2(self):
+        try:
+            test_timeout(0.02, "timeout.com")
+        except Exception as e:
+            self.assertIsInstance(e, fido2.ctap.CtapError)
+            self.assertEqual(e.code,
+                             fido2.ctap.CtapError.ERR.KEEPALIVE_CANCEL)
+            try:
+                test_timeout(0.3, "timeout2.com")
+            except Exception as e:
+                self.assertIsInstance(e, fido2.ctap.CtapError)
+                self.assertEqual(e.code,
+                                 fido2.ctap.CtapError.ERR.KEEPALIVE_CANCEL)
+            for i in range(3):
+                time.sleep(0.1)
+                self.test_ping()
+        else:
+            self.assertTrue(False)
+
 
     def test_deny_credentials(self):
         rp = {'id': "test-deny-credentials",

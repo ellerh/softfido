@@ -360,9 +360,13 @@ impl Device {
         let (value, lang, length) = req.args();
         let [index, ty] = value.to_le_bytes();
         let r#type = DT::from_primitive(ty).unwrap();
-        println!(
+        log!(
+            USB,
             "GET_DESCRIPTOR: type: {:?} index: {} lang: {} length: {} ",
-            r#type, index, lang, length
+            r#type,
+            index,
+            lang,
+            length
         );
         let mut out = vec![0u8; length as usize];
         use std::io::Cursor;

@@ -12,7 +12,7 @@ struct Args {
 
 fn main() {
     let args = parse_args();
-    let token = Token::new(
+    let token = Token::open(
         &args.pkcs11_module,
         args.token_label.as_ref(),
         args.pin_file

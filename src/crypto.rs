@@ -12,14 +12,11 @@ use cryptoki::session::Session;
 use cryptoki::slot::Slot;
 use secrecy::{zeroize::Zeroize, SecretString};
 use std::convert::TryInto;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 #[derive(Debug)]
-struct KeyStore {
+pub struct Token {
     s: Session,
-    // #[allow(dead_code)]
-    // // guard.drop unlocks the global mutex
-    // guard: MutexGuard<'a, ()>,
 }
 
 pub enum Pin {
@@ -89,12 +86,8 @@ fn curve_oid(name: &str) -> &'static [u8] {
     const OID: &[u8] =
         &[0x06, 0x08, 0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07];
     match name {
-        "secp256r1" =>
-        /*"1.2.840.10045.3.1.7".as_bytes() */
-        {
-            OID
-        }
-        _ => panic!("Uknown curve: {}", name),
+        "secp256r1" => OID,
+        _ => panic!("Unknown curve: {}", name),
     }
 }
 
@@ -168,8 +161,8 @@ fn get_pkcs11(module: &str) -> R<Pkcs11> {
     }
 }
 
-impl KeyStore {
-    fn open(module: &str, label: &str, pin: Pin) -> R<KeyStore> {
+impl Token {
+    pub fn open(module: &str, label: &str, pin: Pin) -> R<Token> {
         //let guard = MUTEX.lock().map_err(|e| e.to_string())?;
         let pkcs11 = get_pkcs11(module)?;
         let slot = match find_token(&pkcs11, label)?[..] {
@@ -179,35 +172,35 @@ impl KeyStore {
         };
         // Note: open_rw_session clones pkcs11.
         let s = login(&pkcs11, slot, pin)?;
-        let token = KeyStore { s };
+        let token = Token { s };
         match token.find_secret_key()? {
             None => {
-                log!("Generating secret key...");
+                log!(CRYPTO, "Generating secret key...");
                 token.create_secret_key()?
             }
-            _ => log!("Found secret key."),
+            _ => log!(CRYPTO, "Found secret key."),
         };
         match token.find_token_counter()? {
             None => {
-                log!("Generating token counter...");
+                log!(CRYPTO, "Generating token counter...");
                 token.create_token_counter(0)?
             }
-            _ => log!(
-                "Found token counter. ({})",
-                token.increment_token_counter()?
-            ),
+            _ => {
+                let val = token.increment_token_counter()?;
+                log!(CRYPTO, "Found token counter. ({})", val)
+            }
         };
         Ok(token)
     }
 
     fn find_secret_key(&self) -> R<Option<ObjectHandle>> {
-        let attrs = &vec![
+        let attrs = [
             A::Label(SECRET_KEY_LABEL.into()),
             A::Class(ObjectClass::SECRET_KEY),
         ];
         let r = self
             .s
-            .find_objects(attrs)
+            .find_objects(&attrs)
             .or_else(|e| Err(format!("find_objects failed: {}", &e)))?;
         match r.len() {
             0 => Ok(None),
@@ -217,7 +210,7 @@ impl KeyStore {
     }
 
     fn find_token_counter(&self) -> R<Option<ObjectHandle>> {
-        let attrs = vec![
+        let attrs = [
             A::Label(TOKEN_COUNTER_LABEL.into()),
             A::Class(ObjectClass::DATA),
         ];
@@ -231,7 +224,7 @@ impl KeyStore {
     fn create_secret_key(&self) -> CResult<()> {
         self.s.generate_key(
             &M::AesKeyGen,
-            &vec![
+            &[
                 A::Class(ObjectClass::SECRET_KEY),
                 A::KeyType(KeyType::AES),
                 A::ValueLen(32.into()),
@@ -250,7 +243,7 @@ impl KeyStore {
     }
 
     fn create_token_counter(&self, value: u32) -> CResult<()> {
-        self.s.create_object(&vec![
+        self.s.create_object(&[
             A::Class(ObjectClass::DATA),
             A::Token(true),
             A::Label(TOKEN_COUNTER_LABEL.into()),
@@ -263,7 +256,7 @@ impl KeyStore {
 
     pub fn increment_token_counter(&self) -> CResult<u32> {
         let counter = self.find_token_counter().unwrap().unwrap();
-        let template = vec![AttributeType::Value];
+        let template = [AttributeType::Value];
         let attrs = self.s.get_attributes(counter, &template)?;
         let bytes = match &attrs[..] {
             [A::Value(bytes)] => bytes,
@@ -281,12 +274,12 @@ impl KeyStore {
     // The wrapped private key is also the credentialId.
     // The public key is an (x, y) point of an elliptic curve.
     pub fn generate_key_pair(&self) -> R<(Vec<u8>, (Vec<u8>, Vec<u8>))> {
-        let pub_attrs = vec![
+        let pub_attrs = [
             A::KeyType(KeyType::EC),
             A::Token(false),
             A::EcParams(curve_oid("secp256r1").into()),
         ];
-        let priv_attrs = &vec![A::Token(false), A::Extractable(true)];
+        let priv_attrs = [A::Token(false), A::Extractable(true)];
         let (pub_key, priv_key) = self
             .s
             .generate_key_pair(&M::EccKeyPairGen, &pub_attrs, &priv_attrs)
@@ -305,7 +298,7 @@ impl KeyStore {
 
     pub fn is_valid_id(&self, key: &[u8]) -> bool {
         let wrapping_key = self.find_secret_key().unwrap().unwrap();
-        let template = vec![
+        let template = [
             A::Class(ObjectClass::PRIVATE_KEY),
             A::KeyType(KeyType::EC),
             A::Token(false),
@@ -321,7 +314,7 @@ impl KeyStore {
 
     pub fn sign(&self, key: &[u8], data: &[u8]) -> R<Vec<u8>> {
         let wrapping_key = self.find_secret_key()?.unwrap();
-        let attrs = vec![
+        let attrs = [
             A::Class(ObjectClass::PRIVATE_KEY),
             A::KeyType(KeyType::EC),
             A::Token(false),
@@ -336,7 +329,6 @@ impl KeyStore {
     }
 
     pub fn encrypt(&self, data: &[u8]) -> R<Vec<u8>> {
-        println!("encrypt: data.len={}", data.len());
         let len = data.len();
         assert!(len <= 255);
         let d =
@@ -346,17 +338,17 @@ impl KeyStore {
     }
 
     pub fn decrypt(&self, data: &[u8]) -> R<Vec<u8>> {
-        println!("decrypt");
+        log!(CRYPTO, "decrypt");
         if data.len() % 32 != 0 || data.len() == 0 {
             Err("data has invalid length")?
         }
         let key = self.find_secret_key()?.unwrap();
         let d = self.s.decrypt(&M::AesEcb, key, data)?;
-        let len = d[0];
-        if 1 + len as usize > d.len() {
+        let len = d[0] as usize;
+        if 1 + len > d.len() {
             Err("invalid decrypted data")?
         }
-        Ok(d[1..1 + len as usize].to_vec())
+        Ok(d[1..1 + len].to_vec())
     }
 
     // FIXME: use clock from token
@@ -439,90 +431,44 @@ impl<'a> x509::SubjectPublicKeyInfo for EcSubjectPublicKeyInfo<'a> {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Token(Arc<Mutex<KeyStore>>);
-
-impl Token {
-    pub fn new(module: &str, label: &str, pin: Pin) -> R<Token> {
-        Ok(Token(Arc::new(Mutex::new(KeyStore::open(
-            &module, &label, pin,
-        )?))))
-    }
-    pub fn increment_token_counter(&self) -> CResult<u32> {
-        self.0.lock().unwrap().increment_token_counter()
-    }
-    pub fn sha256_hash(&self, data: &[u8]) -> CResult<Vec<u8>> {
-        self.0.lock().unwrap().sha256_hash(data)
-    }
-    pub fn generate_key_pair(&self) -> R<(Vec<u8>, (Vec<u8>, Vec<u8>))> {
-        self.0.lock().unwrap().generate_key_pair()
-    }
-    pub fn is_valid_id(&self, key: &[u8]) -> bool {
-        self.0.lock().unwrap().is_valid_id(key)
-    }
-    pub fn sign(&self, key: &[u8], data: &[u8]) -> R<Vec<u8>> {
-        self.0.lock().unwrap().sign(key, data)
-    }
-    pub fn encrypt(&self, data: &[u8]) -> R<Vec<u8>> {
-        self.0.lock().unwrap().encrypt(data)
-    }
-    pub fn decrypt(&self, data: &[u8]) -> R<Vec<u8>> {
-        self.0.lock().unwrap().decrypt(data)
-    }
-    pub fn create_certificate(
-        &self,
-        wrapped_priv_key: &[u8],
-        pub_key: &[u8],
-        issuer: &str,
-        subject: &str,
-        not_before: DateTime<Utc>,
-        not_after: Option<DateTime<Utc>>,
-    ) -> R<Vec<u8>> {
-        self.0.lock().unwrap().create_certificate(
-            wrapped_priv_key,
-            pub_key,
-            issuer,
-            subject,
-            not_before,
-            not_after,
-        )
-    }
-}
-
 #[cfg(test)]
 pub mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn test_token() -> R<Token> {
         let lib = "/usr/lib/softhsm/libsofthsm2.so";
         let label = "test-softfido";
         let pin = Pin::String(String::from("fedcba").into());
-        Ok(Token::new(lib, label, pin)?)
+        Token::open(lib, label, pin)
     }
 
-    pub fn get_token() -> R<Token> {
-        static TOKEN: Mutex<Option<Token>> = Mutex::new(None);
+    pub fn get_token<'a>() -> Arc<Mutex<Token>> {
+        static TOKEN: Mutex<Option<Arc<Mutex<Token>>>> = Mutex::new(None);
         match &mut *TOKEN.lock().unwrap() {
-            Some(t) => Ok(t.clone()),
-            opt @ None => Ok(opt.insert(test_token()?).clone()),
+            Some(t) => t.clone(),
+            opt @ None => {
+                let arc = Arc::new(Mutex::new(test_token().unwrap()));
+                let _ = opt.insert(arc.clone());
+                arc
+            }
         }
     }
 
     #[test]
     fn open_token() -> R<()> {
-        get_token()?;
-        get_token()?;
-        get_token()?;
+        get_token();
+        get_token();
+        get_token();
         Ok(())
     }
 
     #[test]
     // this is run in another thread
-    fn open_token2() -> R<()> {
-        get_token()?;
-        get_token()?;
-        get_token()?;
-        Ok(())
+    fn open_token2() {
+        get_token();
+        get_token();
+        get_token();
     }
 
     #[test]
@@ -554,15 +500,16 @@ pub mod tests {
     }
 
     #[test]
-    fn get_keys() -> R<()> {
-        let token = get_token()?;
-        token.generate_key_pair()?;
-        Ok(())
+    fn get_keys() {
+        let token = get_token();
+        let token = token.lock().unwrap();
+        token.generate_key_pair().unwrap();
     }
 
     #[test]
     fn print_cert() -> R<()> {
-        let token = get_token()?;
+        let token = get_token();
+        let token = token.lock().unwrap();
         let (wpriv_key, (x, y)) = token.generate_key_pair()?;
         let pub_key = [&[4u8][..], &x[..], &y].concat();
         let not_before = chrono::Utc::now();

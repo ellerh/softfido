@@ -9,6 +9,7 @@ use packed_struct::prelude::PackedStruct;
 use std::cmp::min;
 use std::sync::mpsc;
 use std::sync::mpsc::{Receiver, RecvError, RecvTimeoutError, Sender};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use usb::URB;
@@ -20,7 +21,7 @@ pub struct Parser {
     input_rx: Receiver<ParserInput>,
     input_tx: Sender<ParserInput>,
     queue_port: QPort,
-    token: Token,
+    token: Arc<Mutex<Token>>,
     prompt: Prompt,
     cid_counter: u32,
     tag_counter: Tag,
@@ -101,24 +102,24 @@ pub struct InitResponse {
 }
 
 fn output_loop(output: Receiver<Box<URB>>, queue: Receiver<Pkt>) {
-    log!("start output loop");
+    log!(CTAPHID, "start output loop");
     for pkt in queue {
         let mut buf = Some(pkt.into());
         loop {
             let urb = output.recv().unwrap();
-            log!("output urb");
+            log!(USBIP, "output urb");
             match urb.complete(buf) {
                 Ok(None) => break,
                 Ok(_) => panic!("complete() returned a buffer"),
                 Err(usb::CompletionError::Unlinked(b)) => {
-                    log!("skipping unlinked urb");
+                    log!(USBIP, "skipping unlinked urb");
                     buf = b;
                     continue;
                 }
             }
         }
     }
-    log!("output loop finished");
+    log!(CTAPHID, "output loop finished");
 }
 
 type Pkt = [u8; PACKET_SIZE];
@@ -260,7 +261,7 @@ impl Assembler {
             (false, cmd) => cmd,
             (true, _) => {
                 // ignore spurious continuation packet
-                eprintln!("ignoring spurious continuation packet");
+                log!(CTAPHID, "ignoring spurious continuation packet");
                 return self.assemble();
             }
         };
@@ -330,7 +331,7 @@ impl Iterator for Assembler {
 
 impl Parser {
     pub fn new(
-        token: Token,
+        token: Arc<Mutex<Token>>,
         prompt: Prompt,
     ) -> (Sender<Box<URB>>, Sender<Box<URB>>) {
         let (input, asm_rx) = mpsc::channel();
@@ -364,7 +365,7 @@ impl Parser {
         (input, output)
     }
     fn input_loop(&mut self) {
-        log!("start input loop");
+        log!(CTAPHID, "start input loop");
         loop {
             use AssemblerError::*;
             use ParserInput::*;
@@ -375,16 +376,15 @@ impl Parser {
                     self.send_error(cid, ERR_BUSY)
                 }
                 Ok(c @ Consent(..)) => {
-                    log!("ignoring belated consent: {:?}", c)
+                    log!(CTAPHID, "ignoring belated consent: {:?}", c)
                 }
-                Ok(Status(..)) => todo!(), //ignore canceled transcations
                 Ok(x) => {
                     dbg!(x);
                     todo!()
                 }
             }
         }
-        log!("input loop finished");
+        log!(CTAPHID, "input loop finished");
     }
     fn dispatch_message(&mut self, msg: Message) {
         let Message { cid, cmd, data } = msg;
@@ -417,7 +417,7 @@ impl Parser {
     fn allocate_channel(&mut self, nonce: &[u8; 8]) {
         let cid = self.cid_counter + 1;
         self.cid_counter = cid;
-        log!("allocate channel: {}", cid);
+        log!(CTAPHID, "allocate channel: {}", cid);
         let response = InitResponse {
             nonce: nonce.clone(),
             channelid: cid,
@@ -435,13 +435,13 @@ impl Parser {
     fn send_reply(&self, cid: u32, cmd: u8, data: Vec<u8>) {
         let queue = &self.queue_port;
         let msg = Message::new(cid, cmd, data);
-        log!("msg={:0X?}", msg);
+        log!(CTAPHID, "msg={:0X?}", msg);
         for pkt in msg.packetize() {
             queue.send(pkt).unwrap();
         }
     }
     fn send_error(&self, cid: u32, code: u8) {
-        eprintln!("send_error");
+        log!(CTAPHID, "CTAPHID_ERROR");
         self.send_reply(cid, CTAPHID_ERROR, vec![code])
     }
     fn ping_cmd(&mut self, cid: u32, data: Vec<u8>) {
@@ -452,9 +452,9 @@ impl Parser {
         cid: u32,
         cmd: u8,
         data: Vec<u8>,
-        fun: fn(Vec<u8>, ctap2::GetConsent, Token) -> Vec<u8>,
+        fun: fn(Vec<u8>, ctap2::GetConsent, &Token) -> Vec<u8>,
     ) {
-        eprintln!("monitor_request");
+        log!(CTAPHID, "monitor_request");
         let token = self.token.clone();
         let tx = self.input_tx.clone();
         let tag = self.tag_counter;
@@ -462,7 +462,8 @@ impl Parser {
         let handle = thread::spawn(move || {
             let tport = TPort(tx);
             let get_consent = |x| tport.get_consent(x);
-            tport.done(fun(data, &get_consent, token))
+            let token = token.lock().unwrap();
+            tport.done(fun(data, &get_consent, &token))
         });
         type Status = Option<Sender<Result<bool, ()>>>;
         let mut status = None;
@@ -472,7 +473,7 @@ impl Parser {
                     None => STATUS_PROCESSING,
                     Some(_) => STATUS_UPNEEDED,
                 };
-                log!("sending CTAPHID_KEEPALIVE");
+                log!(CTAPHID, "sending CTAPHID_KEEPALIVE");
                 self.send_reply(cid, CTAPHID_KEEPALIVE, vec![code]);
             }
             *s = new;
@@ -493,8 +494,12 @@ impl Parser {
                 }
                 Ok(Consent(answer, t)) => match &status {
                     _ if t != tag => {
-                        log!("ignoring belated consent");
-                        todo!()
+                        log!(
+                            CTAPHID,
+                            "ignoring belated consent: {} {}",
+                            t,
+                            answer
+                        );
                     }
                     Some(tx) if t == tag => {
                         tx.send(Ok(answer)).unwrap();
@@ -503,22 +508,22 @@ impl Parser {
                     _ => todo!(),
                 },
                 Err(RecvTimeoutError::Timeout) => {
-                    eprintln!("timeout");
+                    log!(CTAPHID, "timeout");
                     let s = status.clone();
                     change_status(&mut status, s);
                 }
                 Ok(Asm(Ok(msg))) => match (msg.cmd, &status) {
                     _ if msg.cid != cid => {
-                        log!("busy tag={} cid={}", tag, cid);
+                        log!(CTAPHID, "busy tag={} cid={}", tag, cid);
                         self.send_error(msg.cid, ERR_BUSY)
                     }
                     (CTAPHID_CANCEL, Some(tx)) => {
-                        log!("cancelling tag={} cid={}", tag, cid);
+                        log!(CTAPHID, "cancelling tag={}", tag);
                         tx.send(Err(())).unwrap();
                         change_status(&mut status, None);
                     }
                     (CTAPHID_CANCEL, None) => {
-                        log!("can't cancel while processing");
+                        log!(CTAPHID, "can't cancel while processing");
                     }
                     _ => todo!(),
                 },
@@ -537,18 +542,19 @@ impl Parser {
             match r {
                 Ok(x) => tx.send(ParserInput::Consent(x, tag)).unwrap(),
                 Err(e) => {
-                    log!("yes_or_no_p failed: {:?}", e);
+                    log!(CTAPHID, "yes_or_no_p failed: {:?}", e);
                     tx.send(ParserInput::Consent(false, tag)).unwrap()
                 }
             }
         });
     }
     fn cbor_cmd(&mut self, cid: u32, data: Vec<u8>) {
-        eprintln!("cbor_cmd");
+        log!(CTAPHID, "CTAPHID_CBOR");
         let fun = ctap2::process_request;
         self.monitor_request(cid, CTAPHID_CBOR, data, fun)
     }
     fn msg_cmd(&mut self, cid: u32, data: Vec<u8>) {
+        log!(CTAPHID, "CTAPHID_MSG");
         let fun = u2f::process_request;
         self.monitor_request(cid, CTAPHID_MSG, data, fun)
     }
@@ -647,8 +653,8 @@ pub mod tests {
     }
 
     type CTAPHID = (Sender<Box<URB>>, Sender<Box<URB>>);
-    fn open_ctaphid() -> CTAPHID {
-        let token = crypto::tests::get_token().unwrap();
+    pub fn open_ctaphid() -> CTAPHID {
+        let token = crypto::tests::get_token();
         let prompt = prompt::yes_or_no_p;
         Parser::new(token, prompt)
     }
