@@ -13,10 +13,11 @@ serde = { version = "1.0", features = ["derive"] }
 serde_cbor = "0.10.2"
 #pkcs11 = "0.4.1"
 #cryptoki = "0.4.1"
-cryptoki = { path = "/scratch/rust/rust-cryptoki/cryptoki" }
+cryptoki = "0.6.1"
+#cryptoki = { path = "/scratch2/rust/rust-cryptoki/cryptoki" }
 #secstr = "0.4.0"
-#pinentry = "0.5.0"
-pinentry = { path = "/scratch/rust/pinentry-rs" }
+pinentry = "0.5.0"
+#pinentry = { path = "/scratch2/rust/pinentry-rs" }
 secrecy = "0.8.0"
 x509 = "0.1.2"
 chrono = "0.4"

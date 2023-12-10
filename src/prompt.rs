@@ -8,8 +8,8 @@ use secrecy::SecretString;
 
 // FIXME: report report this as bug to the pinentry_rs maintainer.
 fn escape_string(s: &str) -> String {
-    //s.replace("\n", "%0A")
-    s.into()
+    s.replace("\n", "%0A")
+    //s.into()
 }
 
 pub fn yes_or_no_p(prompt: &str) -> Result<bool, String> {
