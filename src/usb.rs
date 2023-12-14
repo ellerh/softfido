@@ -366,7 +366,6 @@ impl Device {
     fn get_descriptor(&self, req: SetupPacket) -> Vec<u8> {
         let (value, lang, length) = req.args();
         let [index, ty] = value.to_le_bytes();
-        eprintln!("index={index} ty={ty}");
         let r#type = DT::from_primitive(ty).unwrap();
         log!(
             USB,
