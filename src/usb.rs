@@ -131,6 +131,13 @@ enum DescriptorType {
     DeviceQualifier = 6,
     OtherSpeedConfiguration = 7,
     InterfacePower = 8,
+    OTG = 9,
+    Debug = 10,
+    InterfaceAssociation = 11,
+    BOS = 15,
+    DeviceCapability = 16,
+    SuperspeedUsbEndpointCompanion = 48,
+    SuperspeedplusIsochronousEndpointCompanion = 49,
 }
 
 use DescriptorType as DT;
@@ -359,6 +366,7 @@ impl Device {
     fn get_descriptor(&self, req: SetupPacket) -> Vec<u8> {
         let (value, lang, length) = req.args();
         let [index, ty] = value.to_le_bytes();
+        eprintln!("index={index} ty={ty}");
         let r#type = DT::from_primitive(ty).unwrap();
         log!(
             USB,
@@ -395,7 +403,8 @@ impl Device {
             }
             (String, 0, 0) => self.get_lang_descriptor(),
             (String, i, LANG_ID_EN_US) => self.get_string_descriptor(i),
-            _ => todo!(),
+            (Debug, 0, 0) => vec![], // Hmm. not sure what to do here
+            _ => todo!("GET_DESCRIPTOR: type={type:?} index={index}"),
         }
     }
 
