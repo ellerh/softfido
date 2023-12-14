@@ -153,7 +153,7 @@ fn get_pkcs11(module: &str) -> R<Pkcs11> {
     match map.get(&pbuf) {
         Some(p) => Ok(p.clone()),
         None => {
-            let mut pkcs11 = Pkcs11::new(pbuf.clone())?;
+            let pkcs11 = Pkcs11::new(pbuf.clone())?;
             pkcs11.initialize(CInitializeArgs::OsThreads)?;
             map.insert(pbuf, pkcs11.clone());
             Ok(pkcs11)
