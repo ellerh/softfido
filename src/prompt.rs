@@ -1,7 +1,6 @@
 // Copyright: Helmut Eller
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-//use pinentry_rs;
 use crate::error::R;
 use pinentry;
 use secrecy::SecretString;
@@ -12,7 +11,7 @@ fn escape_string(s: &str) -> String {
     //s.into()
 }
 
-pub fn yes_or_no_p(prompt: &str) -> Result<bool, String> {
+pub fn yes_or_no_p(prompt: &str) -> R<bool> {
     let escaped = escape_string(prompt);
     let mut dialog =
         match pinentry::ConfirmationDialog::with_default_binary() {
@@ -23,7 +22,7 @@ pub fn yes_or_no_p(prompt: &str) -> Result<bool, String> {
         .with_ok("Yes")
         .with_cancel("No")
         .confirm(&escaped)
-        .map_err(|e| format!("{:?}", e))
+        .map_err(|e| e.to_string().into())
 }
 
 pub fn read_pin(prompt: &str) -> R<SecretString> {

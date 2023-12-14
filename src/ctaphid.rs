@@ -14,7 +14,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use usb::URB;
 
-pub type Prompt = fn(&str) -> Result<bool, String>;
+pub type Prompt = fn(&str) -> crate::error::R<bool>;
 type QPort = Sender<Pkt>;
 
 pub struct Parser {

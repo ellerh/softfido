@@ -1,6 +1,8 @@
 use softfido::{crypto, usbip};
 use std::net::TcpListener;
 
+type R<T> = Result<T, Box<dyn std::error::Error>>;
+
 fn main() {
     let token = crypto::Token::open(
         "/usr/lib/softhsm/libsofthsm2.so",
@@ -14,20 +16,20 @@ fn main() {
     usbip::start_server(&listener, token, yes_or_no_p)
 }
 
-fn yes_or_no_p(prompt: &str) -> Result<bool, String> {
+fn yes_or_no_p(prompt: &str) -> R<bool> {
     let c = |pat| prompt.contains(pat);
     if c("timeout.com") {
         std::thread::sleep(std::time::Duration::from_millis(200));
-        Err("timed out".to_string())
+        Err("timed out".into())
     } else if c("timeout2.com") {
         std::thread::sleep(std::time::Duration::from_millis(400));
-        Err("timed out".to_string())
+        Err("timed out".into())
     } else if (c("test-deny-credentials") && c("registration credentials"))
         || (c("test-deny-challenge") && c("signing challenge"))
     {
         Ok(false)
     } else if c("test-close-window") && c("registration credentials") {
-        Err("window closed".to_string())
+        Err("window closed".into())
     } else {
         Ok(true)
     }
