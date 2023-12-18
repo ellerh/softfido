@@ -3,7 +3,7 @@ extern crate packed_struct;
 extern crate serde_cbor;
 
 #[macro_use]
-mod log;
+pub mod log;
 
 mod binio;
 pub mod crypto;

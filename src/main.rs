@@ -1,17 +1,21 @@
 // Copyright: Helmut Eller
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-use softfido::{crypto::Pin, crypto::Token, prompt, usbip};
+use softfido::{crypto::Pin, crypto::Token, log, prompt, usbip};
 use std::net::TcpListener;
 
 struct Args {
     pkcs11_module: String,
     token_label: String,
     pin_file: Option<String>,
+    log_levels: Vec<log::LogLevel>,
 }
 
 fn main() {
     let args = parse_args();
+    for &l in args.log_levels.iter() {
+        log::set_log_level(l);
+    }
     let token = Token::open(
         &args.pkcs11_module,
         args.token_label.as_ref(),
@@ -30,11 +34,11 @@ fn default_args() -> Args {
         pkcs11_module: "/usr/lib/softhsm/libsofthsm2.so".to_string(),
         token_label: "softfido".to_string(),
         pin_file: None,
+        log_levels: [].into(),
     }
 }
 
-fn print_usage() {
-    let defaults = default_args();
+fn print_usage(defaults: &Args) {
     println!(
         r"USAGE: {prog} [OPTIONS]
 OPTIONS:
@@ -44,11 +48,15 @@ OPTIONS:
   --pkcs11-module <LIB>    Load LIB to access the PCKC11 store 
                              [{lib}]
   --pin-file <FILE>        Read gpg encryped User-PIN from FILE
-                             [{pinfile:?}]",
+                             [{pinfile:?}]
+  --debug[=FLAG]           Print lots of debugging information
+                           FLAG can be: usbip|usb|ctaphid|ctap|crypto
+                             {debug_flags:?}",
         prog = std::env::args().next().unwrap_or("<progname>".into()),
         label = defaults.token_label,
         lib = defaults.pkcs11_module,
-        pinfile = defaults.pin_file
+        pinfile = defaults.pin_file,
+        debug_flags = defaults.log_levels,
     )
 }
 
@@ -74,8 +82,25 @@ fn parse_args() -> Args {
                 "--pin-file" => {
                     r.pin_file = Some(req(args.next(), "--pin-file"));
                 }
+                "--debug" => {
+                    use log::LogLevel::*;
+                    for l in [USBIP, USB, CTAPHID, CTAP, CRYPTO] {
+                        if !r.log_levels.contains(&l) {
+                            r.log_levels.push(l)
+                        }
+                    }
+                }
+                "--debug=usbip" => r.log_levels.push(log::LogLevel::USBIP),
+                "--debug=usb" => r.log_levels.push(log::LogLevel::USB),
+                "--debug=ctaphid" => {
+                    r.log_levels.push(log::LogLevel::CTAPHID)
+                }
+                "--debug=ctap" => r.log_levels.push(log::LogLevel::CTAP),
+                "--debug=crypto" => {
+                    r.log_levels.push(log::LogLevel::CRYPTO)
+                }
                 "--help" => {
-                    print_usage();
+                    print_usage(&r);
                     std::process::exit(0)
                 }
                 x => panic!("Invalid argument: {}", x),

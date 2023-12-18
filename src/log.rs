@@ -3,6 +3,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum LogLevel {
     USBIP = 0,
     USB,
@@ -11,15 +12,15 @@ pub enum LogLevel {
     CRYPTO,
 }
 
-static LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::CTAP as usize);
+static LOG_LEVEL: AtomicUsize = AtomicUsize::new(0);
 
 #[allow(dead_code)]
 pub fn set_log_level(level: LogLevel) {
-    LOG_LEVEL.store(level as usize, Ordering::Relaxed);
+    LOG_LEVEL.fetch_or(1 << (level as usize), Ordering::Relaxed);
 }
 
 pub fn log(level: LogLevel, s: &str) {
-    if LOG_LEVEL.load(Ordering::Relaxed) <= level as usize {
+    if (LOG_LEVEL.load(Ordering::Relaxed) & 1 << (level as usize)) != 0 {
         eprintln!("{}", s);
     }
 }
